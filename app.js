@@ -26,7 +26,7 @@ const STROKE = [
 ];
 
 let db = { tickets: [], pickers: [] };
-let view = { screen: 'home', id: null, draft: null, sheet: null, confirmDelete: null };
+let view = { screen: 'home', id: null, draft: null, sheet: null, confirmDelete: null, queue: null, note: null };
 let toastTimer;
 
 // ---------- storage ----------
@@ -38,9 +38,9 @@ function save() {
   try { localStorage.setItem(STORE, JSON.stringify(db)); return true; }
   catch (e) { toast('Could not save on this device. Save a backup file now.'); return false; }
 }
-function toast(msg) {
+function toast(msg, ms = 4500) {
   const t = $('#toast'); t.textContent = msg; t.hidden = false;
-  clearTimeout(toastTimer); toastTimer = setTimeout(() => { t.hidden = true; }, 4500);
+  clearTimeout(toastTimer); toastTimer = setTimeout(() => { t.hidden = true; }, ms);
 }
 
 // ---------- ticket logic ----------
@@ -76,6 +76,14 @@ function newTicketFrom(draft) {
     lines: draft.lines.map(l => ({ id: uid(), item: l.item.trim(), desc: l.desc.trim(), bin: (l.bin || '').trim(), binBlank: !(l.bin || '').trim(), qty: +l.qty, product: l.product || '', picked: 0, problems: [] })),
     labels: (draft.products || []).filter(p => p.kind === 'conversion').flatMap(p => Array.from({ length: Math.max(1, Math.round(p.qty)) }, (_, i) => ({ id: uid(), product: p.item, unit: i + 1, of: Math.max(1, Math.round(p.qty)), ...P.labelDefaults(p) })))
   };
+}
+
+// Why a ticket can't be saved yet, or '' when it's ready.
+function draftProblem(d) {
+  if (!d.orderNumber.trim() || !d.ticket.trim()) return 'Enter the order number and the pick ticket number.';
+  if (!d.lines.length) return 'Add at least one line to pick.';
+  if (d.lines.some(l => !(+l.qty > 0))) return 'Every line needs a quantity above zero.';
+  return '';
 }
 
 // Part numbers for the conversion steps, e.g. pump C13120PB, new LE-415SI, removed LE-20PB, model C131-415SI on driver C131.
@@ -144,7 +152,7 @@ function homeView() {
     </button>`;
   };
   return `<section class="start">
-      <button class="big primary" data-act="import"><span class="bigIcon" aria-hidden="true">⇪</span>Import pick ticket<small>PDF pick ticket or bill of material</small></button>
+      <button class="big primary" data-act="import"><span class="bigIcon" aria-hidden="true">⇪</span>Import pick tickets<small>One PDF or several at once</small></button>
       <button class="big" data-act="manual"><span class="bigIcon" aria-hidden="true">✎</span>Enter by hand<small>When a PDF won't import</small></button>
     </section>
     <h2 class="listHead">In progress <span>${open.length}</span></h2>
@@ -158,7 +166,9 @@ function reviewView() {
   const d = view.draft;
   const field = (k, label, opts = '') => `<label>${label}<input id="d-${k}" data-draft="${k}" value="${esc(d[k])}" ${opts}></label>`;
   const area = (k, label) => `<label>${label}<textarea id="d-${k}" data-draft="${k}" rows="4">${esc(d[k])}</textarea></label>`;
-  return `<div class="pageHead"><div><p class="eyebrow">${d.fromPdf ? 'Check the import' : 'Enter by hand'}</p><h1>${d.fromPdf ? 'Does this match the paper ticket?' : 'New pick ticket'}</h1></div></div>
+  const more = view.queue && view.queue.length ? ` · ${view.queue.length} more after this one` : '';
+  return `<div class="pageHead"><div><p class="eyebrow">${d.fromPdf ? 'Check the import' : 'Enter by hand'}${more}</p><h1>${d.fromPdf ? 'Does this match the paper ticket?' : 'New pick ticket'}</h1></div></div>
+    ${view.note ? `<p class="note strong">${esc(view.note)}</p>` : ''}
     ${d.fromPdf ? `<p class="note">Compare the numbers, bins and quantities with the PDF before saving. Fix anything that's wrong here. A bin left empty becomes a blank for the picker to fill in.${d.unreadable ? ' <strong>No text was found in this PDF, so it may be a scan. Enter the lines by hand.</strong>' : ''}</p>` : ''}
     <div class="panel grid">
       ${field('orderNumber', 'Order number', 'inputmode="numeric" required')}
@@ -181,7 +191,7 @@ function reviewView() {
       </tbody></table></div>
       <button data-act="addLine">＋ Add line</button>
     </div>
-    <div class="actionsBar"><button data-act="home">Cancel</button><button class="primary" data-act="saveDraft">Save pick ticket</button></div>`;
+    <div class="actionsBar">${view.queue ? '<button data-act="nextDraft">Skip this PDF</button>' : '<button data-act="home">Cancel</button>'}<button class="primary" data-act="saveDraft">Save pick ticket</button></div>`;
 }
 
 function pickerSelect(t) {
@@ -422,7 +432,7 @@ function renderSheet() {
 // ---------- actions ----------
 const current = () => ticketById(view.id);
 const lineById = id => current().lines.find(x => x.id === id);
-const go = (screen, id = view.id) => { view.screen = screen; view.id = id; view.sheet = null; render(); window.scrollTo(0, 0); };
+const go = (screen, id = view.id) => { view.screen = screen; view.id = id; view.sheet = null; if (screen !== 'review') view.queue = view.note = null; render(); window.scrollTo(0, 0); };
 const stamp = (t, text) => { (t.log = t.log || []).push({ at: now(), text }); };
 
 function openProblem(l, picked, then = null) {
@@ -479,13 +489,18 @@ const actions = {
   saveDraft: () => {
     const d = view.draft;
     d.lines = d.lines.filter(l => String(l.item).trim());
-    if (!d.orderNumber.trim() || !d.ticket.trim()) return toast('Enter the order number and the pick ticket number.');
-    if (!d.lines.length) return toast('Add at least one line to pick.');
-    if (d.lines.some(l => !(+l.qty > 0))) return toast('Every line needs a quantity above zero.');
+    const problem = draftProblem(d); if (problem) return toast(problem);
     const dup = db.tickets.find(t => t.ticket === d.ticket.trim());
     if (dup) return toast(`Pick ticket ${d.ticket} is already saved${dup.status === 'done' ? ' and completed' : ''}.`);
     const t = newTicketFrom(d); stamp(t, d.fromPdf ? 'Imported from PDF' : 'Entered by hand');
-    db.tickets.push(t); save(); view.draft = null; go('ticket', t.id);
+    db.tickets.push(t); save();
+    if (view.queue) actions.nextDraft(null, `Pick ticket ${t.ticket} added to In progress.`);
+    else { view.draft = null; go('ticket', t.id); }
+  },
+  // After several PDFs came in at once: the next one that needs checking, or home when none are left.
+  nextDraft: (b, note = '') => {
+    if (view.queue && view.queue.length) { view.draft = view.queue.shift(); view.note = note; go('review', null); }
+    else { view.draft = null; go('home', null); if (note) toast(note); }
   },
   open: b => go('ticket', b.dataset.id),
   pickAll: b => { const t = current(), l = lineById(b.dataset.id); l.picked = l.qty - problemQty(l); stamp(t, `${l.item}: picked ${fmtQty(l.picked)}`); save(); render(); },
@@ -604,22 +619,58 @@ const changeActions = {
   }
 };
 
+async function readPdf(file) {
+  const doc = await pdfjsLib.getDocument({ data: new Uint8Array(await file.arrayBuffer()) }).promise;
+  const pages = [];
+  for (let n = 1; n <= doc.numPages; n++) {
+    const page = await doc.getPage(n), vp = page.getViewport({ scale: 1 }), content = await page.getTextContent();
+    pages.push(content.items.filter(i => i.str && i.str.trim()).map(i => ({ text: i.str, x: i.transform[4], y: vp.height - i.transform[5] })));
+  }
+  await doc.destroy();
+  const d = P.parsePages(pages);
+  return { fromPdf: true, ...d, lines: d.lines.map(l => ({ ...l })) };
+}
+
 async function importPdf(file) {
   if (!file) return;
   toast('Reading ' + file.name + '…');
   try {
-    const doc = await pdfjsLib.getDocument({ data: new Uint8Array(await file.arrayBuffer()) }).promise;
-    const pages = [];
-    for (let n = 1; n <= doc.numPages; n++) {
-      const page = await doc.getPage(n), vp = page.getViewport({ scale: 1 }), content = await page.getTextContent();
-      pages.push(content.items.filter(i => i.str && i.str.trim()).map(i => ({ text: i.str, x: i.transform[4], y: vp.height - i.transform[5] })));
-    }
-    await doc.destroy();
-    const d = P.parsePages(pages);
-    view.draft = { fromPdf: true, ...d, lines: d.lines.map(l => ({ ...l })) };
+    view.draft = await readPdf(file);
     $('#toast').hidden = true;
     go('review', null);
   } catch (e) { console.error(e); toast('This PDF could not be read. Use Enter by hand instead.'); }
+}
+
+// Several PDFs at once, such as the new tickets in the shared pick ticket folder. A ticket that reads cleanly goes
+// straight onto the In progress list, one the app already has is skipped, and the rest wait on the check screen.
+let importing = false;
+async function importPdfs(files) {
+  files = files.filter(f => /pdf/i.test(f.type + f.name));
+  if (files.length < 2) return importPdf(files[0]);
+  if (importing) return toast('Still reading the last PDFs.');
+  importing = true;
+  let added = 0, already = 0; const unread = [], check = [];
+  try {
+    for (const [i, file] of files.entries()) {
+      toast(`Reading ${i + 1} of ${files.length}…`, 60000);
+      let d;
+      try { d = await readPdf(file); } catch (e) { console.error(e); unread.push(file.name); continue; }
+      if (d.ticket.trim() && db.tickets.some(t => t.ticket === d.ticket.trim())) already++;
+      else if (draftProblem(d) || d.lines.some(l => !String(l.item).trim())) check.push(d);
+      else { const t = newTicketFrom(d); stamp(t, 'Imported from PDF'); db.tickets.push(t); added++; }
+    }
+  } finally { importing = false; }
+  save();
+  const n = (k, one, many) => `${k} ${k === 1 ? one : many}`;
+  const msg = !added && !check.length && !unread.length ? `All ${already} pick tickets are already in the app.` : [
+    added && `${n(added, 'pick ticket', 'pick tickets')} added to In progress.`,
+    already && `${n(already, 'was', 'were')} already in the app.`,
+    check.length && `${n(check.length, 'needs', 'need')} checking.`,
+    unread.length && `Could not read ${unread.join(', ')}. Use Enter by hand for ${unread.length === 1 ? 'it' : 'those'}.`
+  ].filter(Boolean).join(' ');
+  // On the check screen the summary sits above the form, where a toast would cover its buttons.
+  if (check.length) { $('#toast').hidden = true; view.draft = check.shift(); view.queue = check; view.note = msg; go('review', null); }
+  else { go('home', null); toast(msg, 10000); }
 }
 
 // ---------- events ----------
@@ -649,10 +700,11 @@ document.addEventListener('input', e => {
   else if (el.id === 'pNote' && view.sheet) view.sheet.note = el.value;
 });
 $('#sheet').addEventListener('click', e => { if (e.target.id === 'sheet') actions.closeSheet(); });
+$('#toast').addEventListener('click', e => { e.currentTarget.hidden = true; });
 document.addEventListener('keydown', e => { if (e.key === 'Escape' && view.sheet) actions.closeSheet(); if (e.key === 'Enter' && view.sheet && view.sheet.kind === 'name') actions.saveName(); if (e.key === 'Enter' && e.target.id === 'pNote') e.target.blur(); });
-$('#pdfInput').addEventListener('change', e => { importPdf(e.target.files[0]); e.target.value = ''; });
+$('#pdfInput').addEventListener('change', e => { const files = [...e.target.files]; e.target.value = ''; importPdfs(files); });
 document.addEventListener('dragover', e => e.preventDefault());
-document.addEventListener('drop', e => { e.preventDefault(); const f = e.dataTransfer.files[0]; if (f && /pdf/i.test(f.type + f.name)) importPdf(f); });
+document.addEventListener('drop', e => { e.preventDefault(); importPdfs([...e.dataTransfer.files]); });
 
 pdfjsLib.GlobalWorkerOptions.workerSrc = 'pdf.worker.min.js';
 load(); render();
