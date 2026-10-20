@@ -1,0 +1,33 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<title>Assemblies & Conversions</title>
+<meta name="theme-color" content="#0e5e52">
+<meta name="apple-mobile-web-app-capable" content="yes">
+<meta name="mobile-web-app-capable" content="yes">
+<meta name="apple-mobile-web-app-title" content="Picking">
+<meta name="apple-mobile-web-app-status-bar-style" content="default">
+<link rel="manifest" href="manifest.webmanifest">
+<link rel="apple-touch-icon" href="apple-touch-icon.png">
+<link rel="icon" href="icon-192.png">
+<link rel="stylesheet" href="app.css">
+</head>
+<body>
+<header class="top">
+  <button id="backBtn" class="quiet" data-act="back" hidden>‹ Back</button>
+  <button class="brand" data-act="home">Assemblies &amp; Conversions<small>Pick station</small></button>
+  <button class="quiet" data-act="settings">Settings</button>
+</header>
+<main id="main"></main>
+<input type="file" id="pdfInput" accept="application/pdf,.pdf" hidden>
+<div id="sheet" hidden></div>
+<div id="toast" role="status" aria-live="polite" hidden></div>
+<div id="printArea"></div>
+<script src="pdf.min.js"></script>
+<script src="pdf-lib.min.js"></script>
+<script src="parse.js"></script>
+<script src="app.js"></script>
+</body>
+</html>
