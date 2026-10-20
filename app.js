@@ -103,7 +103,7 @@ function convSteps(t) {
     { key: 'unpack', text: 'Remove contents and verify the individual parts in the packages.' },
     { key: 'pumpBox', problemIf: 'no', line: n.pump, text: 'Are all contents in the pump box correct and in good working order?', sub: n.pump ? 'Pump box: ' + n.pump.item : '' },
     { key: 'lePackage', problemIf: 'no', line: n.le, text: 'Are all contents in the LE package correct and in good working order?', sub: n.le ? 'LE package: ' + n.le.item : '' },
-    { key: 'swap', text: `Remove the ${n.oldLE || 'original'} liquid end from the driver and place it with the contents from the ${n.newLE || 'new liquid end'} package.` },
+    { key: 'swap', text: `Remove the ${n.oldLE || 'original'} liquid end from the driver and place it with the items from the pump box.` },
     { key: 'size', text: 'Verify liquid end is the correct size.' },
     { key: 'diaphragmOut', text: 'Remove the diaphragm from the driver.', sub: 'See product manual for detailed instructions.' },
     { key: 'keep', text: 'Place the original diaphragm with the original liquid end and screws.' },
