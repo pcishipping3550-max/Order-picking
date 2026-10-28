@@ -5,8 +5,8 @@ const P = TicketParser;
 const PROBLEMS = ['Damaged', 'Incomplete package', 'Not available'];
 const AFTER_PICK = ['Damaged', 'Incomplete package']; // what an inspection or a conversion can find in parts already picked
 const STORE = 'ac-picking-v1';
-// The Power Automate flow's web address. It works like a password, so it stays on this iPad and out of backups.
-const FLOW = 'ac-picking-flow';
+// The Power Automate flows' web addresses work like passwords, so they stay on this iPad, out of the ticket store and backups.
+const FLOW = 'ac-picking-flow', FILEFLOW = 'ac-picking-fileflow', SEEN = 'ac-picking-seen';
 const $ = s => document.querySelector(s);
 const esc = s => String(s == null ? '' : s).replace(/[&<>"']/g, c => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[c]));
 const uid = () => (crypto.randomUUID ? crypto.randomUUID() : Date.now().toString(36) + Math.random().toString(36).slice(2));
@@ -28,7 +28,7 @@ const STROKE = [
 ];
 
 let db = { tickets: [], pickers: [] };
-let view = { screen: 'home', id: null, draft: null, sheet: null, confirmDelete: null, queue: null, note: null, flow: null };
+let view = { screen: 'home', id: null, draft: null, sheet: null, confirmDelete: null, queue: null, note: null, flow: null, pending: [] };
 let toastTimer;
 
 // ---------- storage ----------
@@ -153,7 +153,9 @@ function homeView() {
         : `<span class="chip">${esc(stateLabel(t))}</span><small>${t.picker ? esc(t.picker) : 'Not started'}</small>`}</span>
     </button>`;
   };
-  return `<section class="start">
+  const waiting = view.pending.length;
+  return `${waiting ? `<div class="note strong pending"><span>${waiting === 1 ? '1 new pick ticket from the folder needs' : `${waiting} new pick tickets from the folder need`} checking.</span><button data-act="checkPending">Check ${waiting === 1 ? 'it' : 'them'}</button></div>` : ''}
+    <section class="start">
       <button class="big primary" data-act="import"><span class="bigIcon" aria-hidden="true">⇪</span>Import pick tickets<small>One PDF or several at once</small></button>
       <button class="big" data-act="manual"><span class="bigIcon" aria-hidden="true">✎</span>Enter by hand<small>When a PDF won't import</small></button>
     </section>
@@ -394,47 +396,120 @@ function settingsView() {
     <div class="panel"><h3>About</h3><p class="muted">Assemblies & Conversions · pilot version 2 · ${db.tickets.length} pick tickets saved</p></div>`;
 }
 
-const flowUrl = () => { try { return localStorage.getItem(FLOW) || ''; } catch (e) { return ''; } };
+// ---------- pick tickets from Power Automate ----------
+// Two flows hand the iPad the Pick Tickets folder: one lists the folder, the other sends one PDF by its id.
+const stored = k => { try { return localStorage.getItem(k) || ''; } catch (e) { return ''; } };
+const keep = (k, v) => { try { if (v) localStorage.setItem(k, v); else localStorage.removeItem(k); } catch (e) { /* kept for this visit only */ } };
+const isAddress = s => /^https:\/\/\S+$/i.test(s);
+// Folder files the app has dealt with: brought in, already in the app, unreadable, or skipped on the check screen.
+let seen;
+try { seen = new Set(JSON.parse(stored(SEEN) || '[]')); } catch (e) { seen = new Set(); }
+function markSeen(id) { seen.add(id); keep(SEEN, JSON.stringify([...seen].slice(-3000))); }
+
 function flowPanel() {
   const f = view.flow;
-  return `<div class="panel"><h3>Pick tickets from Power Automate</h3><p class="muted">Test only for now. Paste the flow's web address, then tap Test. The address stays on this iPad.</p>
-    <div class="flowTest"><label>Flow address<input id="flowUrl" type="url" value="${esc(flowUrl())}" placeholder="https://" autocomplete="off" autocapitalize="off" autocorrect="off" spellcheck="false"></label>
+  const box = (id, key, label) => `<label>${label}<input id="${id}" type="url" value="${esc(stored(key))}" placeholder="https://" autocomplete="off" autocapitalize="off" autocorrect="off" spellcheck="false"></label>`;
+  return `<div class="panel"><h3>Pick tickets from Power Automate</h3><p class="muted">New PDFs in the Pick Tickets folder come in by themselves when the app opens. Paste the address of each flow, then tap Test. The addresses stay on this iPad.</p>
+    <div class="flowTest">${box('flowUrl', FLOW, 'Flow that lists the folder')}${box('fileFlowUrl', FILEFLOW, 'Flow that sends one PDF')}
       <button data-act="testFlow" ${f && f.busy ? 'disabled' : ''}>${f && f.busy ? 'Testing…' : 'Test'}</button>
       ${f && !f.busy ? `<p class="note${f.ok ? '' : ' strong'}">${esc(f.text)}</p>` : ''}</div></div>`;
 }
 
-// Settings > Test: can this iPad call the flow and read its answer? A POST with a plain text body goes out without
-// the browser asking the flow's permission first, so the flow only has to add Access-Control-Allow-Origin to its answer.
-async function askFlow(url) {
-  if (!navigator.onLine) return { ok: false, text: 'This iPad is offline. Connect to Wi-Fi, then test again.' };
+// A POST with a plain text body goes out without the browser asking the flow's permission first, so a flow only has to
+// add Access-Control-Allow-Origin to its answer. Gives back the answer, or in plain words why there is none.
+async function callFlow(url, id) {
+  if (!navigator.onLine) return { problem: 'This iPad is offline. Connect to Wi-Fi, then try again.' };
+  const target = id ? `${url}${url.includes('?') ? '&' : '?'}id=${encodeURIComponent(id)}` : url;
   const ask = async mode => {
     const ctl = new AbortController(), timer = setTimeout(() => ctl.abort(), 60000);
-    try { return await fetch(url, { method: 'POST', mode, body: '{"test":true}', signal: ctl.signal }); }
+    try { return await fetch(target, { method: 'POST', mode, body: '{}', signal: ctl.signal }); }
     finally { clearTimeout(timer); }
   };
-  let res;
-  try { res = await ask('cors'); }
-  catch (e) {
-    if (e.name === 'AbortError') return { ok: false, text: 'The flow took more than a minute to answer. Check that it is turned on, then test again.' };
+  try {
+    const res = await ask('cors');
+    if (res.ok) return { res };
+    let why = ''; try { why = JSON.parse(await res.text()).error.message || ''; } catch (e) { /* no error message */ }
+    return { problem: `The flow answered with error ${res.status}${why ? ': ' + why : '.'}${[401, 403].includes(res.status) ? ' In the flow, set Who can trigger the flow to Anyone.' : ''}` };
+  } catch (e) {
+    if (e.name === 'AbortError') return { problem: 'The flow took more than a minute to answer. Check that it is turned on, then try again.' };
     // Safari only says "Load failed". Asking again without reading the answer tells "can't reach it" from "not allowed to read it".
     const reached = await ask('no-cors').then(() => true, () => false);
-    return { ok: false, text: reached
+    return { problem: reached
       ? 'The flow answered, but the iPad is not allowed to read the answer. In the flow, check that Who can trigger the flow is set to Anyone and that the Response step has the header Access-Control-Allow-Origin with the value *.'
-      : 'The iPad could not reach the flow. Check that the whole address was pasted, then test again.' };
+      : 'The iPad could not reach the flow. Check that the whole address was pasted, then try again.' };
   }
-  const text = await res.text().catch(() => '');
-  let data = null; try { data = JSON.parse(text); } catch (e) { /* not JSON */ }
-  if (!res.ok) {
-    const why = data && data.error && data.error.message;
-    return { ok: false, text: `The flow answered with error ${res.status}${why ? ': ' + why : '.'}${[401, 403].includes(res.status) ? ' In the flow, set Who can trigger the flow to Anyone.' : ''}` };
-  }
-  const files = Array.isArray(data) ? data : data && [data.value, data.body].find(Array.isArray);
-  if (!files) return { ok: false, text: `The flow answered, but not with a list of files. Its answer was: ${text.slice(0, 200) || '(empty)'}` };
-  const names = files.filter(f => f && !f.IsFolder).map(f => f.Name || f.DisplayName || f.name).filter(Boolean);
-  if (!names.length) return { ok: true, text: 'It works. The flow answered, and there are no files in the folder yet.' };
-  const shown = names.slice(0, 10).join(', ') + (names.length > 10 ? ` and ${names.length - 10} more` : '');
-  return { ok: true, text: `It works. The flow sees ${names.length} ${names.length === 1 ? 'file' : 'files'} in the folder: ${shown}.` };
 }
+const fileName = f => f.Name || f.DisplayName || f.name || '';
+const isPdfFile = f => !!f && !f.IsFolder && !!f.Id && /\.pdf$/i.test(fileName(f));
+function fileList(text) {
+  let data = null; try { data = JSON.parse(text); } catch (e) { /* not JSON */ }
+  return Array.isArray(data) ? data : (data && [data.value, data.body].find(Array.isArray)) || null;
+}
+// One PDF from the folder, read the same way as an imported one.
+async function pdfFromFolder(url, f) {
+  const r = await callFlow(url, f.Id);
+  if (r.problem) return r;
+  try { return { draft: { ...(await readPdf(new File([await r.res.blob()], fileName(f), { type: 'application/pdf' }))), fileId: f.Id } }; }
+  catch (e) { console.error(e); return { unreadable: true }; }
+}
+
+// Settings > Test: both flows, start to finish, without adding anything to the app.
+async function checkFlows(list, one) {
+  const r = await callFlow(list);
+  if (r.problem) return { ok: false, text: r.problem };
+  const text = await r.res.text().catch(() => '');
+  const files = fileList(text);
+  if (!files) return { ok: false, text: `The flow answered, but not with a list of files. Its answer was: ${text.slice(0, 200) || '(empty)'}` };
+  const names = files.filter(f => f && !f.IsFolder).map(fileName).filter(Boolean);
+  const shown = names.slice(0, 10).join(', ') + (names.length > 10 ? ` and ${names.length - 10} more` : '');
+  const listed = names.length ? `It works. The flow sees ${names.length} ${names.length === 1 ? 'file' : 'files'} in the folder: ${shown}.` : 'It works. The flow answered, and there are no files in the folder yet.';
+  if (!one) return { ok: true, text: `${listed} Next, add the address of the flow that sends one PDF.` };
+  const pdf = files.filter(isPdfFile).sort((a, b) => String(b.LastModified).localeCompare(String(a.LastModified)))[0];
+  if (!pdf) return { ok: true, text: `${listed} Put a pick ticket PDF in the folder to test the flow that sends one PDF.` };
+  const g = await pdfFromFolder(one, pdf);
+  if (g.problem) return { ok: false, text: `${listed} But the flow that sends one PDF didn't work. ${g.problem}` };
+  if (g.unreadable) return { ok: false, text: `${listed} But ${fileName(pdf)} didn't come through as a PDF. In the flow that sends one PDF, check that the Response step's Body is File Content.` };
+  return { ok: true, text: `${listed} It also opened ${fileName(pdf)}${g.draft.ticket ? ` (pick ticket ${g.draft.ticket})` : ''}, so new pick tickets will come in by themselves.` };
+}
+
+// New PDFs in the folder come in by themselves: when the app opens, when it comes back on screen, and on the way back to
+// the list, at most every half minute. Same rules as Import: a clean ticket goes straight to In progress and one the app
+// already has is left out. One that needs checking waits on the home screen until someone checks or skips it.
+let lastPickup = 0, pickingUp = false;
+async function pickup(force = false) {
+  const list = stored(FLOW), one = stored(FILEFLOW);
+  if (embedded || pickingUp || !isAddress(list) || !isAddress(one) || !navigator.onLine || (!force && Date.now() - lastPickup < 30000)) return;
+  pickingUp = true; lastPickup = Date.now();
+  let added = 0; const unread = [], check = [];
+  try {
+    const r = await callFlow(list);
+    const waiting = new Set(view.pending.map(d => d.fileId));
+    const fresh = ((r.res && fileList(await r.res.text().catch(() => ''))) || []).filter(f => isPdfFile(f) && !seen.has(f.Id) && !waiting.has(f.Id))
+      .sort((a, b) => String(a.LastModified).localeCompare(String(b.LastModified)));
+    for (const f of fresh) {
+      const g = await pdfFromFolder(one, f);
+      if (g.problem) break; // the rest come next time
+      if (g.unreadable) { unread.push(fileName(f)); markSeen(f.Id); continue; }
+      const d = g.draft;
+      if (d.ticket.trim() && db.tickets.some(t => t.ticket === d.ticket.trim())) markSeen(f.Id);
+      else if (draftProblem(d) || d.lines.some(l => !String(l.item).trim())) check.push(d);
+      else { const t = newTicketFrom(d); stamp(t, 'Picked up from the Pick Tickets folder'); db.tickets.push(t); save(); markSeen(f.Id); added++; }
+    }
+  } catch (e) { console.error(e); }
+  finally { pickingUp = false; }
+  view.pending.push(...check);
+  const n = (k, single, plural) => `${k} ${k === 1 ? single : plural}`;
+  const msg = [
+    added && `${n(added, 'new pick ticket', 'new pick tickets')} added to In progress.`,
+    check.length && `${n(check.length, 'new pick ticket needs', 'new pick tickets need')} checking.`,
+    unread.length && `Could not read ${unread.join(', ')} from the folder. Use Enter by hand for ${unread.length === 1 ? 'it' : 'those'}.`
+  ].filter(Boolean).join(' ');
+  if (!msg) return;
+  if (view.screen === 'home') render();
+  toast(msg, 8000);
+}
+// A ticket from the folder that was checked: saved or skipped, it isn't offered again.
+function settled(d) { if (!d || !d.fileId) return; markSeen(d.fileId); view.pending = view.pending.filter(x => x !== d); }
 
 // ---------- bottom sheet (problem entry, picker name, delete) ----------
 // A problem found while picking can be any of the three types. One found after picking (inspection or conversion)
@@ -477,7 +552,7 @@ function renderSheet() {
 // ---------- actions ----------
 const current = () => ticketById(view.id);
 const lineById = id => current().lines.find(x => x.id === id);
-const go = (screen, id = view.id) => { view.screen = screen; view.id = id; view.sheet = view.flow = null; if (screen !== 'review') view.queue = view.note = null; render(); window.scrollTo(0, 0); };
+const go = (screen, id = view.id) => { view.screen = screen; view.id = id; view.sheet = view.flow = null; if (screen !== 'review') view.queue = view.note = null; render(); window.scrollTo(0, 0); if (screen === 'home') pickup(); };
 const stamp = (t, text) => { (t.log = t.log || []).push({ at: now(), text }); };
 
 function openProblem(l, picked, then = null) {
@@ -528,13 +603,16 @@ const actions = {
   back: () => { const t = current(); if (t && t.status !== 'done' && ['reports', 'inspect', 'convert'].includes(view.screen)) go('ticket'); else go('home', null); },
   settings: () => go('settings', null),
   testFlow: async () => {
-    const url = $('#flowUrl').value.trim();
-    try { if (url) localStorage.setItem(FLOW, url); else localStorage.removeItem(FLOW); } catch (e) { /* kept for this visit only */ }
-    if (!/^https:\/\/\S+$/i.test(url)) { view.flow = { ok: false, text: 'Paste the whole flow address first. It starts with https://' }; return render(); }
+    const list = $('#flowUrl').value.trim(), one = $('#fileFlowUrl').value.trim();
+    keep(FLOW, list); keep(FILEFLOW, one);
+    const problem = !isAddress(list) ? 'Paste the address of the flow that lists the folder. It starts with https://'
+      : one && !isAddress(one) ? 'The address of the flow that sends one PDF should start with https://' : '';
+    if (problem) { view.flow = { ok: false, text: problem }; return render(); }
     view.flow = { busy: true }; render();
-    const result = await askFlow(url);
+    const result = await checkFlows(list, one);
     if (view.flow && view.flow.busy) { view.flow = result; render(); }
   },
+  checkPending: () => { if (!view.pending.length) return go('home', null); view.draft = view.pending[0]; view.queue = view.pending.slice(1); go('review', null); },
   import: () => $('#pdfInput').click(),
   manual: () => { view.draft = { fromPdf: false, type: 'Sales', orderNumber: '', ticket: '', taker: '', customer: '', customerId: '', billTo: '', shipTo: '', service: '', products: [], lines: [{ item: '', desc: '', qty: 1, bin: '' }] }; go('review', null); },
   addLine: () => { view.draft.lines.push({ item: '', desc: '', qty: 1, bin: '' }); render(); },
@@ -547,11 +625,13 @@ const actions = {
     if (dup) return toast(`Pick ticket ${d.ticket} is already saved${dup.status === 'done' ? ' and completed' : ''}.`);
     const t = newTicketFrom(d); stamp(t, d.fromPdf ? 'Imported from PDF' : 'Entered by hand');
     db.tickets.push(t); save();
+    settled(d);
     if (view.queue) actions.nextDraft(null, `Pick ticket ${t.ticket} added to In progress.`);
     else { view.draft = null; go('ticket', t.id); }
   },
   // After several PDFs came in at once: the next one that needs checking, or home when none are left.
   nextDraft: (b, note = '') => {
+    settled(view.draft);
     if (view.queue && view.queue.length) { view.draft = view.queue.shift(); view.note = note; go('review', null); }
     else { view.draft = null; go('home', null); if (note) toast(note); }
   },
@@ -760,6 +840,7 @@ document.addEventListener('dragover', e => e.preventDefault());
 document.addEventListener('drop', e => { e.preventDefault(); importPdfs([...e.dataTransfer.files]); });
 
 pdfjsLib.GlobalWorkerOptions.workerSrc = 'pdf.worker.min.js';
-load(); render();
+load(); render(); pickup(true);
+document.addEventListener('visibilitychange', () => { if (document.visibilityState === 'visible') pickup(); });
 if ('serviceWorker' in navigator && !embedded && location.protocol === 'https:') navigator.serviceWorker.register('sw.js').catch(() => {});
 if (navigator.storage && navigator.storage.persist) navigator.storage.persist().catch(() => {});

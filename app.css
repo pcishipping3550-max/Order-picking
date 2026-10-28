@@ -214,6 +214,7 @@ input.binBlank:disabled { opacity: 1; }
 .rTable tbody { break-inside: avoid; }
 .num { text-align: right !important; font-variant-numeric: tabular-nums; }
 .names { padding-left: 1.1rem; margin: 0; } .names li { margin: .25rem 0; }
+.pending { display: flex; flex-wrap: wrap; align-items: center; justify-content: space-between; gap: .75rem; margin-bottom: 1rem; }
 .flowTest { display: grid; gap: .75rem; justify-items: start; } .flowTest label, .flowTest .note { justify-self: stretch; margin: 0; }
 .fileBtn { position: relative; display: inline-flex; align-items: center; justify-content: center; min-height: 48px; padding: .6rem 1rem; border: 1px solid var(--line); border-radius: var(--r); background: var(--surface); color: var(--ink); font-size: 1rem; font-weight: 600; cursor: pointer; }
 .fileBtn input { position: absolute; inset: 0; opacity: 0; cursor: pointer; }
