@@ -5,6 +5,8 @@ const P = TicketParser;
 const PROBLEMS = ['Damaged', 'Incomplete package', 'Not available'];
 const AFTER_PICK = ['Damaged', 'Incomplete package']; // what an inspection or a conversion can find in parts already picked
 const STORE = 'ac-picking-v1';
+// The Power Automate flow's web address. It works like a password, so it stays on this iPad and out of backups.
+const FLOW = 'ac-picking-flow';
 const $ = s => document.querySelector(s);
 const esc = s => String(s == null ? '' : s).replace(/[&<>"']/g, c => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[c]));
 const uid = () => (crypto.randomUUID ? crypto.randomUUID() : Date.now().toString(36) + Math.random().toString(36).slice(2));
@@ -26,7 +28,7 @@ const STROKE = [
 ];
 
 let db = { tickets: [], pickers: [] };
-let view = { screen: 'home', id: null, draft: null, sheet: null, confirmDelete: null, queue: null, note: null };
+let view = { screen: 'home', id: null, draft: null, sheet: null, confirmDelete: null, queue: null, note: null, flow: null };
 let toastTimer;
 
 // ---------- storage ----------
@@ -388,7 +390,50 @@ function settingsView() {
       <div class="row"><button data-act="backup">Save backup file</button><label class="fileBtn">Restore from backup<input id="restoreFile" type="file" accept=".json,application/json" data-act-change="restore"></label></div>
       <p class="muted small">Restore adds pick tickets that aren't already on this iPad. Nothing is overwritten.</p></div>
     <div class="panel"><h3>Picker names</h3>${db.pickers.length ? `<ul class="names">${db.pickers.map(n => `<li>${esc(n)} <button class="small quiet" data-act="dropPicker" data-name="${esc(n)}">Remove</button></li>`).join('')}</ul>` : '<p class="muted">Names are added the first time a picker chooses "Add my name".</p>'}</div>
+    ${flowPanel()}
     <div class="panel"><h3>About</h3><p class="muted">Assemblies & Conversions · pilot version 2 · ${db.tickets.length} pick tickets saved</p></div>`;
+}
+
+const flowUrl = () => { try { return localStorage.getItem(FLOW) || ''; } catch (e) { return ''; } };
+function flowPanel() {
+  const f = view.flow;
+  return `<div class="panel"><h3>Pick tickets from Power Automate</h3><p class="muted">Test only for now. Paste the flow's web address, then tap Test. The address stays on this iPad.</p>
+    <div class="flowTest"><label>Flow address<input id="flowUrl" type="url" value="${esc(flowUrl())}" placeholder="https://" autocomplete="off" autocapitalize="off" autocorrect="off" spellcheck="false"></label>
+      <button data-act="testFlow" ${f && f.busy ? 'disabled' : ''}>${f && f.busy ? 'Testing…' : 'Test'}</button>
+      ${f && !f.busy ? `<p class="note${f.ok ? '' : ' strong'}">${esc(f.text)}</p>` : ''}</div></div>`;
+}
+
+// Settings > Test: can this iPad call the flow and read its answer? A POST with a plain text body goes out without
+// the browser asking the flow's permission first, so the flow only has to add Access-Control-Allow-Origin to its answer.
+async function askFlow(url) {
+  if (!navigator.onLine) return { ok: false, text: 'This iPad is offline. Connect to Wi-Fi, then test again.' };
+  const ask = async mode => {
+    const ctl = new AbortController(), timer = setTimeout(() => ctl.abort(), 60000);
+    try { return await fetch(url, { method: 'POST', mode, body: '{"test":true}', signal: ctl.signal }); }
+    finally { clearTimeout(timer); }
+  };
+  let res;
+  try { res = await ask('cors'); }
+  catch (e) {
+    if (e.name === 'AbortError') return { ok: false, text: 'The flow took more than a minute to answer. Check that it is turned on, then test again.' };
+    // Safari only says "Load failed". Asking again without reading the answer tells "can't reach it" from "not allowed to read it".
+    const reached = await ask('no-cors').then(() => true, () => false);
+    return { ok: false, text: reached
+      ? 'The flow answered, but the iPad is not allowed to read the answer. In the flow, check that Who can trigger the flow is set to Anyone and that the Response step has the header Access-Control-Allow-Origin with the value *.'
+      : 'The iPad could not reach the flow. Check that the whole address was pasted, then test again.' };
+  }
+  const text = await res.text().catch(() => '');
+  let data = null; try { data = JSON.parse(text); } catch (e) { /* not JSON */ }
+  if (!res.ok) {
+    const why = data && data.error && data.error.message;
+    return { ok: false, text: `The flow answered with error ${res.status}${why ? ': ' + why : '.'}${[401, 403].includes(res.status) ? ' In the flow, set Who can trigger the flow to Anyone.' : ''}` };
+  }
+  const files = Array.isArray(data) ? data : data && [data.value, data.body].find(Array.isArray);
+  if (!files) return { ok: false, text: `The flow answered, but not with a list of files. Its answer was: ${text.slice(0, 200) || '(empty)'}` };
+  const names = files.filter(f => f && !f.IsFolder).map(f => f.Name || f.DisplayName || f.name).filter(Boolean);
+  if (!names.length) return { ok: true, text: 'It works. The flow answered, and there are no files in the folder yet.' };
+  const shown = names.slice(0, 10).join(', ') + (names.length > 10 ? ` and ${names.length - 10} more` : '');
+  return { ok: true, text: `It works. The flow sees ${names.length} ${names.length === 1 ? 'file' : 'files'} in the folder: ${shown}.` };
 }
 
 // ---------- bottom sheet (problem entry, picker name, delete) ----------
@@ -432,7 +477,7 @@ function renderSheet() {
 // ---------- actions ----------
 const current = () => ticketById(view.id);
 const lineById = id => current().lines.find(x => x.id === id);
-const go = (screen, id = view.id) => { view.screen = screen; view.id = id; view.sheet = null; if (screen !== 'review') view.queue = view.note = null; render(); window.scrollTo(0, 0); };
+const go = (screen, id = view.id) => { view.screen = screen; view.id = id; view.sheet = view.flow = null; if (screen !== 'review') view.queue = view.note = null; render(); window.scrollTo(0, 0); };
 const stamp = (t, text) => { (t.log = t.log || []).push({ at: now(), text }); };
 
 function openProblem(l, picked, then = null) {
@@ -482,6 +527,14 @@ const actions = {
   home: () => go('home', null),
   back: () => { const t = current(); if (t && t.status !== 'done' && ['reports', 'inspect', 'convert'].includes(view.screen)) go('ticket'); else go('home', null); },
   settings: () => go('settings', null),
+  testFlow: async () => {
+    const url = $('#flowUrl').value.trim();
+    try { if (url) localStorage.setItem(FLOW, url); else localStorage.removeItem(FLOW); } catch (e) { /* kept for this visit only */ }
+    if (!/^https:\/\/\S+$/i.test(url)) { view.flow = { ok: false, text: 'Paste the whole flow address first. It starts with https://' }; return render(); }
+    view.flow = { busy: true }; render();
+    const result = await askFlow(url);
+    if (view.flow && view.flow.busy) { view.flow = result; render(); }
+  },
   import: () => $('#pdfInput').click(),
   manual: () => { view.draft = { fromPdf: false, type: 'Sales', orderNumber: '', ticket: '', taker: '', customer: '', customerId: '', billTo: '', shipTo: '', service: '', products: [], lines: [{ item: '', desc: '', qty: 1, bin: '' }] }; go('review', null); },
   addLine: () => { view.draft.lines.push({ item: '', desc: '', qty: 1, bin: '' }); render(); },
