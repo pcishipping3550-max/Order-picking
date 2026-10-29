@@ -237,7 +237,7 @@ function ticketView(t) {
     <p class="progressText">${done} of ${t.lines.length} lines done${probs ? ` · <span class="warnText">${probs} discrepanc${probs === 1 ? 'y' : 'ies'}</span>` : ''}</p>
     <ol class="lines ${needPicker ? 'locked' : ''}">${t.lines.map(l => lineRow(l, needPicker)).join('')}</ol>
     <div class="actionsBar">
-      ${deleteButton(t)}${t.waiting ? '<button data-act="reprint">Print Taker report again</button>' : ''}
+      ${deleteButton(t)}${t.waiting ? emailButton(t) + '<button data-act="reprint">Print Taker report again</button>' : ''}
       <button class="primary" data-act="next" ${all && !needPicker ? '' : 'disabled'}>${next}</button>
     </div>`;
 }
@@ -339,6 +339,16 @@ function takerReport(t) {
     ${reportRows(ticketProblems(t), p => `<td><strong>${esc(p.line.item)}</strong></td><td>${esc(p.line.desc)}</td><td class="num">${fmtQty(p.qty)}</td><td>${esc(p.type)}</td>`, true)}
     </table></section>`;
 }
+// The Taker report as plain text in a new Gmail message, subject filled in (john 2026-10-29). Gmail can't be handed an
+// attachment this way, and john prefers the report in the body anyway.
+function takerText(t) {
+  const lines = ['TAKER REPORT - INCOMPLETE', '', `Order: ${t.orderNumber}`, `Pick ticket: ${t.ticket}`, `Type: ${t.type}`, `Taker: ${t.taker || '-'}`,
+    `Inspector: ${t.picker || '-'}`, `Date: ${fmtDate(t.completedAt || now())}`, `Customer: ${t.customer || '-'}`, `Customer #: ${t.customerId || '-'}`,
+    `Bill To: ${(t.billTo || '-').split('\n').join(', ')}`, `Ship To: ${(t.shipTo || '-').split('\n').join(', ')}`, '', 'These items were not delivered on this pick ticket.'];
+  for (const p of ticketProblems(t)) lines.push('', `${p.line.item}  ${p.line.desc}`, `Missing: ${fmtQty(p.qty)}  ${p.type}`, ...(p.needs || []).map(n => 'Part needed: ' + needText(n)), ...(p.note ? ['Notes: ' + p.note] : []));
+  return lines.join('\n');
+}
+const emailButton = t => `<a class="btn" href="${esc('googlegmail:///co?subject=' + encodeURIComponent(`Order ${t.orderNumber} / Pick ticket ${t.ticket} - Taker report`) + '&body=' + encodeURIComponent(takerText(t)))}">Email Taker report</a>`;
 function adjustmentReport(t) {
   if (!adjustProblems(t).length) return '';
   return `<section class="report">${reportHeader(t, 'Inventory adjustment report')}
@@ -362,7 +372,7 @@ function reportsView(t) {
     ${embedded ? '<p class="note">Printing works in the installed iPad app. It is blocked inside this preview window.</p>' : ''}
     <div class="paper">${reportsHtml(t)}</div>
     <div class="actionsBar">
-      ${done ? deleteButton(t) + '<button data-act="home">Back to tickets</button>' : '<button data-act="backToTicket">Back to the items</button>'}
+      ${done ? deleteButton(t) + '<button data-act="home">Back to tickets</button>' : '<button data-act="backToTicket">Back to the items</button>'}${emailButton(t)}
       <button class="primary" data-act="print">${done ? 'Print again' : wait ? 'Print Taker report & wait for parts' : 'Print reports & complete'}</button>
     </div>`;
 }

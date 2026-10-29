@@ -53,6 +53,7 @@ button { min-height: 48px; padding: .6rem 1rem; border-radius: var(--r); border:
 button:hover:not(:disabled) { border-color: var(--accent); }
 button:focus-visible, input:focus-visible, select:focus-visible, textarea:focus-visible, summary:focus-visible { outline: 3px solid var(--accent); outline-offset: 2px; }
 button:disabled { opacity: .45; cursor: not-allowed; }
+a.btn { display: inline-flex; align-items: center; justify-content: center; min-height: 48px; padding: .6rem 1rem; border-radius: var(--r); border: 1px solid var(--line); background: var(--surface); font-weight: 600; color: inherit; text-decoration: none; }
 button.primary { background: var(--accent); border-color: var(--accent); color: var(--accent-ink); }
 button.quiet { background: transparent; border-color: transparent; color: var(--muted); }
 button.danger { background: var(--bad); border-color: var(--bad); color: #fff; }
