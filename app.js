@@ -237,7 +237,7 @@ function ticketView(t) {
     <p class="progressText">${done} of ${t.lines.length} lines done${probs ? ` · <span class="warnText">${probs} discrepanc${probs === 1 ? 'y' : 'ies'}</span>` : ''}</p>
     <ol class="lines ${needPicker ? 'locked' : ''}">${t.lines.map(l => lineRow(l, needPicker)).join('')}</ol>
     <div class="actionsBar">
-      ${deleteButton(t)}
+      ${deleteButton(t)}${t.waiting ? '<button data-act="reprint">Print Taker report again</button>' : ''}
       <button class="primary" data-act="next" ${all && !needPicker ? '' : 'disabled'}>${next}</button>
     </div>`;
 }
@@ -790,6 +790,13 @@ const actions = {
     if (wait) go('ticket'); else render();
     if (embedded) toast(wait ? 'Saved as Waiting for parts. Print from the installed iPad app.' : first ? 'Pick ticket completed. Print from the installed iPad app.' : 'Printing works in the installed iPad app.');
     else setTimeout(() => window.print(), 100);
+  },
+  // Another copy of the Taker report for an order waiting for parts; the order stays as it is.
+  reprint: () => {
+    const t = current();
+    stamp(t, 'Taker report printed again'); save();
+    $('#printArea').innerHTML = printHtml(t);
+    if (embedded) toast('Printing works in the installed iPad app.'); else setTimeout(() => window.print(), 100);
   },
   makeLabels: async b => {
     const t = current(), c = t.labels.find(x => x.id === b.dataset.id);
