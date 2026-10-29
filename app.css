@@ -189,6 +189,8 @@ input.binBlank:disabled { opacity: 1; }
 .sheetBody .actionsBar { background: var(--surface); }
 .noteField { display: grid; gap: .35rem; margin-top: 1rem; font-weight: 600; }
 .noteField input { font-weight: 400; }
+#needRows { display: grid; gap: .5rem; }
+.needRow { display: grid; grid-template-columns: minmax(0, 1fr) 90px; gap: .5rem; }
 
 /* reports (screen preview) */
 .paper { background: #fff; color: #111; border-radius: 6px; box-shadow: 0 1px 3px rgba(0, 0, 0, .15); padding: 1.25rem; margin-bottom: 1rem; overflow-x: auto; }
@@ -212,6 +214,7 @@ input.binBlank:disabled { opacity: 1; }
 .rTable td:first-child, .rTable td:last-child { white-space: nowrap; } /* item numbers and discrepancy types never break */
 .rTable tbody.hasNote tr:first-child td { border-bottom: 0; }
 .rTable tr.rNoteRow td { border-top: 0; padding-top: 0; white-space: normal; overflow-wrap: anywhere; font-family: var(--font-ui); }
+.rTable tr.rNoteRow:not(:last-child) td { border-bottom: 0; }
 .rNoteLbl { margin-right: .5rem; font-size: .75rem; font-weight: 700; letter-spacing: .04em; text-transform: uppercase; color: #555; }
 .rTable tbody { break-inside: avoid; }
 .num { text-align: right !important; font-variant-numeric: tabular-nums; }

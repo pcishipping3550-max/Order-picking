@@ -59,9 +59,13 @@ const labelsLeft = t => t.labels.filter(c => !c.madeAt).length;
 const fmtQty = n => Number.isInteger(n) ? String(n) : String(+n.toFixed(3));
 const isConversion = t => t.products.some(p => p.kind === 'conversion');
 const returnsOf = t => t.products.flatMap(p => p.returns || []);
-// Once every item is checked: the reports when something is wrong (that stops a conversion), else a conversion's steps,
-// else the order is done.
-const nextStep = t => hasProblems(t) ? 'reports' : isConversion(t) ? 'convert' : 'save';
+// Once every item is checked: the reports when something is wrong (that stops a conversion), the rest of the conversion
+// once the parts it waits for are in, else a conversion's steps, else the order is done.
+const nextStep = t => t.waiting ? 'resume' : hasProblems(t) ? 'reports' : isConversion(t) ? 'convert' : 'save';
+// A conversion whose every problem has parts needed can be made whole: only the Taker report prints, and the order
+// waits for the parts at the step where it stopped instead of completing (john 2026-10-29).
+const canWait = t => isConversion(t) && hasProblems(t) && ticketProblems(t).every(p => (p.needs || []).length);
+const partsAwaited = t => ticketProblems(t).flatMap(p => (p.needs || []).map(needText)).join(', ');
 
 function newTicketFrom(draft) {
   return {
@@ -129,6 +133,7 @@ function render() {
 }
 
 function stateLabel(t) {
+  if (t.waiting) return 'Waiting for parts';
   if (!allDone(t)) return `${pickedCount(t)} of ${t.lines.length} lines`;
   if (nextStep(t) !== 'convert') return nextStep(t) === 'reports' ? 'Ready to print reports' : 'Ready to save';
   return t.conv ? `Conversion step ${t.conv.step + 1} of ${convSteps(t).length}` : 'Ready to convert';
@@ -222,11 +227,12 @@ function ticketView(t) {
   const done = pickedCount(t), all = allDone(t), probs = ticketProblems(t).length, left = t.lines.length - done;
   const needPicker = !t.picker, step = nextStep(t);
   const next = !all ? `${left} line${left === 1 ? '' : 's'} left`
-    : step === 'reports' ? 'Print reports' : step === 'save' ? 'Save order' : t.conv ? `Continue conversion · step ${t.conv.step + 1}` : 'Start conversion';
+    : step === 'reports' ? 'Print reports' : step === 'save' ? 'Save order' : t.conv ? `Continue conversion · step ${t.conv.step + 1}` : step === 'resume' ? 'Continue conversion' : 'Start conversion';
   return `<div class="pageHead"><div><p class="eyebrow">${esc(t.type)}${t.customer ? ' · ' + esc(t.customer) : ''}</p><h1>Order ${esc(t.orderNumber)}</h1>${ticketLine(t)}</div>${pickerSelect(t)}</div>
     <details class="panel orderDetails"><summary>Order details</summary>${orderBlock(t)}${t.service ? `<p class="muted">Service item: ${esc(t.service)}</p>` : ''}</details>
     ${t.products.length ? `<div class="panel builds">${t.products.map(p => `<p><span class="chip">${p.kind === 'conversion' ? 'Conversion' : 'Assembly'}</span> <strong>${esc(p.item)}</strong> × ${fmtQty(p.qty)}</p>${p.returns.length ? `<p class="muted">Removed and returned to stock: ${p.returns.map(r => esc(r.item) + ' × ' + fmtQty(r.qty)).join(', ')}</p>` : ''}`).join('')}</div>` : ''}
     ${needPicker ? '<p class="note strong">Choose your name above before checking the items.</p>' : ''}
+    ${t.waiting ? `<p class="note strong">Waiting for parts: ${esc(partsAwaited(t))}. Once you receive the parts, tap Continue conversion.</p>` : ''}
     <div class="progress" role="progressbar" aria-valuemin="0" aria-valuemax="${t.lines.length}" aria-valuenow="${done}"><div style="width:${t.lines.length ? done / t.lines.length * 100 : 0}%"></div></div>
     <p class="progressText">${done} of ${t.lines.length} lines done${probs ? ` · <span class="warnText">${probs} discrepanc${probs === 1 ? 'y' : 'ies'}</span>` : ''}</p>
     <ol class="lines ${needPicker ? 'locked' : ''}">${t.lines.map(l => lineRow(l, needPicker)).join('')}</ol>
@@ -236,7 +242,9 @@ function ticketView(t) {
     </div>`;
 }
 
-const probChips = l => l.problems.length ? `<span class="probs">${l.problems.map(p => `<span class="chip warn">${fmtQty(p.qty)} ${esc(p.type.toLowerCase())}</span>${p.note ? `<span class="probNote">${esc(p.note)}</span>` : ''}`).join(' ')}</span>` : '';
+// A part needed to make a problem good, as it prints: "4 × 12345", or just the part when no quantity was typed.
+const needText = n => (n.qty ? fmtQty(n.qty) + ' × ' : '') + n.part;
+const probChips = l => l.problems.length ? `<span class="probs">${l.problems.map(p => `<span class="chip warn">${fmtQty(p.qty)} ${esc(p.type.toLowerCase())}</span>${(p.needs || []).map(n => `<span class="probNote">Needs ${esc(needText(n))}</span>`).join('')}${p.note ? `<span class="probNote">${esc(p.note)}</span>` : ''}`).join(' ')}</span>` : '';
 
 function lineRow(l, locked) {
   const rem = remaining(l), done = rem === 0, probs = l.problems;
@@ -316,19 +324,26 @@ function reportHeader(t, title) {
     <div class="rAddr"><div><strong>Bill To</strong><pre>${esc(t.billTo || '—')}</pre></div><div><strong>Ship To</strong><pre>${esc(t.shipTo || '—')}</pre></div></div>
   </header>`;
 }
-// Each discrepancy is its own row group, so its optional notes line stays with it.
-const reportRows = (t, cells) => ticketProblems(t).map(p => `<tbody class="${p.note ? 'hasNote' : ''}"><tr>${cells(p)}</tr>${p.note ? `<tr class="rNoteRow"><td colspan="4"><span class="rNoteLbl">Notes</span>${esc(p.note)}</td></tr>` : ''}</tbody>`).join('');
+// Each discrepancy is its own row group, so its parts needed and its optional notes line stay with it.
+const reportRows = (problems, cells, needs) => problems.map(p => {
+  const extra = (needs ? (p.needs || []).map(n => ['Part needed', needText(n)]) : []).concat(p.note ? [['Notes', p.note]] : []);
+  return `<tbody class="${extra.length ? 'hasNote' : ''}"><tr>${cells(p)}</tr>${extra.map(([lbl, text]) => `<tr class="rNoteRow"><td colspan="4"><span class="rNoteLbl">${lbl}</span>${esc(text)}</td></tr>`).join('')}</tbody>`;
+}).join('');
+// A problem with parts needed is made whole by the Taker, so it stays off the inventory report, and the parts needed
+// print on the Taker report only (john 2026-10-29).
+const adjustProblems = t => ticketProblems(t).filter(p => !(p.needs || []).length);
 function takerReport(t) {
   return `<section class="report"><p class="rStamp">INCOMPLETE</p>${reportHeader(t, 'Taker report')}
     <p class="rLead">These items were not delivered on this pick ticket.</p>
     <table class="rTable"><thead><tr><th>Item</th><th>Description</th><th class="num">Missing</th><th>Discrepancy</th></tr></thead>
-    ${reportRows(t, p => `<td><strong>${esc(p.line.item)}</strong></td><td>${esc(p.line.desc)}</td><td class="num">${fmtQty(p.qty)}</td><td>${esc(p.type)}</td>`)}
+    ${reportRows(ticketProblems(t), p => `<td><strong>${esc(p.line.item)}</strong></td><td>${esc(p.line.desc)}</td><td class="num">${fmtQty(p.qty)}</td><td>${esc(p.type)}</td>`, true)}
     </table></section>`;
 }
 function adjustmentReport(t) {
+  if (!adjustProblems(t).length) return '';
   return `<section class="report">${reportHeader(t, 'Inventory adjustment report')}
     <table class="rTable"><thead><tr><th>Item</th><th class="num">Qty</th><th>Bin</th><th>Discrepancy</th></tr></thead>
-    ${reportRows(t, p => `<td><strong>${esc(p.line.item)}</strong></td><td class="num">${fmtQty(p.qty)}</td><td>${esc(p.line.bin)}</td><td>${esc(p.type)}</td>`)}
+    ${reportRows(adjustProblems(t), p => `<td><strong>${esc(p.line.item)}</strong></td><td class="num">${fmtQty(p.qty)}</td><td>${esc(p.line.bin)}</td><td>${esc(p.type)}</td>`, false)}
     </table></section>`;
 }
 const reportsHtml = t => takerReport(t) + adjustmentReport(t);
@@ -336,19 +351,19 @@ const reportsHtml = t => takerReport(t) + adjustmentReport(t);
 const printHtml = t => takerReport(t).repeat(2) + adjustmentReport(t).repeat(2);
 
 function reportsView(t) {
-  const done = t.status === 'done';
+  const done = t.status === 'done', wait = !done && canWait(t);
   if (!hasProblems(t)) return done ? cleanView(t) : ticketView(t);
   return `<div class="pageHead"><div><p class="eyebrow">${done ? 'Completed ' + esc(fmtDate(t.completedAt)) : 'Print reports'}</p><h1>Order ${esc(t.orderNumber)} · ${esc(t.ticket)}</h1></div></div>
     <div class="note strong printSteps">
-      <p>Printing makes 2 copies of each report${done ? '' : ' and completes this pick ticket'}.</p>
+      <p>Printing makes 2 copies of ${adjustProblems(t).length ? 'each report' : 'the Taker report'}${done ? '' : wait ? ' and saves this order as Waiting for parts' : ' and completes this pick ticket'}.</p>
       <p><strong>Taker report:</strong> Place 1 copy of the Taker report with the order and take the other copy to the Taker.</p>
-      <p><strong>Inventory adjustment report:</strong> Attach 1 copy of the inventory report to the deficient item and place that item in the designated area. Give the other copy of the inventory report to the inventory adjuster.${ticketProblems(t).every(p => p.type === 'Not available') ? ' If the item is Not available, discard the extra copy.' : ''}</p>
+      ${adjustProblems(t).length ? `<p><strong>Inventory adjustment report:</strong> Attach 1 copy of the inventory report to the deficient item and place that item in the designated area. Give the other copy of the inventory report to the inventory adjuster.${adjustProblems(t).every(p => p.type === 'Not available') ? ' If the item is Not available, discard the extra copy.' : ''}</p>` : ''}
     </div>
     ${embedded ? '<p class="note">Printing works in the installed iPad app. It is blocked inside this preview window.</p>' : ''}
     <div class="paper">${reportsHtml(t)}</div>
     <div class="actionsBar">
       ${done ? deleteButton(t) + '<button data-act="home">Back to tickets</button>' : '<button data-act="backToTicket">Back to the items</button>'}
-      <button class="primary" data-act="print">${done ? 'Print again' : 'Print reports & complete'}</button>
+      <button class="primary" data-act="print">${done ? 'Print again' : wait ? 'Print Taker report & wait for parts' : 'Print reports & complete'}</button>
     </div>`;
 }
 
@@ -356,7 +371,7 @@ function reportsView(t) {
 function cleanView(t) {
   const back = returnsOf(t).filter(r => r.bin);
   return `<div class="pageHead"><div><p class="eyebrow">Completed ${esc(fmtDate(t.completedAt))}</p><h1>Order ${esc(t.orderNumber)} · ${esc(t.ticket)}</h1></div></div>
-    <p class="note">Completed by ${esc(t.picker || 'the inspector')} with no discrepancies, so there are no reports to print.</p>
+    <p class="note">Completed by ${esc(t.picker || 'the inspector')}${t.madeWhole ? `. Made whole with the parts received: ${esc(t.madeWhole.flatMap(p => p.needs.map(needText)).join(', '))}.` : ' with no discrepancies, so there are no reports to print.'}</p>
     <div class="panel">${orderBlock(t)}${back.length ? `<p class="returned">Returned to inventory: ${back.map(r => `<strong>${esc(r.item)}</strong> in bin <strong>${esc(r.bin)}</strong>`).join(', ')}</p>` : ''}</div>
     <div class="actionsBar">${deleteButton(t)}<button data-act="home">Back to tickets</button></div>`;
 }
@@ -492,6 +507,9 @@ function settled(d) { if (!d || !d.fileId) return; markSeen(d.fileId); view.pend
 // A problem found while checking the items can be any of the three types: Not available is anything shipping didn't
 // bring. One found later, in a conversion, is Damaged or Incomplete package, and comes off the checked quantity.
 const sheetMax = (l, s) => s.picked ? l.picked : remaining(l);
+// Parts needed sit apart from the notes, one part per line, and a new empty line appears once the last one has a
+// part number in it (john 2026-10-29).
+const needRow = (n, i) => `<div class="needRow"><input id="need-${i}-part" data-need="${i}" data-key="part" value="${esc(n.part)}" placeholder="Part number" aria-label="Part needed ${i + 1}" autocapitalize="characters" autocomplete="off" spellcheck="false"><input id="need-${i}-qty" data-need="${i}" data-key="qty" value="${esc(n.qty)}" placeholder="Qty" aria-label="How many of part ${i + 1}" inputmode="decimal" autocomplete="off"></div>`;
 
 function renderSheet() {
   const s = view.sheet, el = $('#sheet');
@@ -499,6 +517,7 @@ function renderSheet() {
   el.hidden = false;
   if (s.kind === 'problem') {
     const t = ticketById(view.id), l = s.lineId ? t.lines.find(x => x.id === s.lineId) : null, max = l ? sheetMax(l, s) : 0;
+    s.needs = s.needs || [{ part: '', qty: '' }];
     el.innerHTML = `<div class="sheetBody" role="dialog" aria-modal="true" aria-labelledby="sheetTitle">
       ${s.choose
         ? `<h2 id="sheetTitle">Which part was missing or damaged?</h2>
@@ -506,8 +525,16 @@ function renderSheet() {
         : `<h2 id="sheetTitle">Problem with ${esc(l.item)}</h2><p class="muted">${esc(l.desc)} · bin ${esc(l.bin || '—')}</p>`}
       ${l ? `<div class="choices">${(s.picked ? AFTER_PICK : PROBLEMS).map(p => `<button class="choice ${s.type === p ? 'on' : ''}" data-act="pType" data-type="${p}" aria-pressed="${s.type === p}">${p}</button>`).join('')}</div>
       <div class="stepper"><span>How many?</span><button class="icon" data-act="pDec" aria-label="Fewer">−</button><output id="pQty">${fmtQty(s.qty)}</output><button class="icon" data-act="pInc" aria-label="More">＋</button><span class="muted">of ${fmtQty(max)} ${s.picked ? 'checked' : 'left'}</span></div>
+      <div class="noteField">Parts needed<div id="needRows">${s.needs.map(needRow).join('')}</div></div>
       <label class="noteField">Notes<input id="pNote" value="${esc(s.note || '')}" placeholder="Optional. Prints on the reports." maxlength="200" autocomplete="off" enterkeyhint="done"></label>` : ''}
       <div class="actionsBar"><button data-act="closeSheet">Cancel</button><button class="primary" data-act="saveProblem" ${l && s.type ? '' : 'disabled'}>Record problem</button></div></div>`;
+  } else if (s.kind === 'more') {
+    // john's step after a conversion problem (2026-10-29), so every missing piece is on the reports the first time round.
+    const t = ticketById(view.id), l = t.lines.find(x => x.id === s.lineId);
+    el.innerHTML = `<div class="sheetBody" role="dialog" aria-modal="true" aria-labelledby="sheetTitle"><h2 id="sheetTitle">Anything else missing or wrong?</h2>
+      <p>Verify the rest of the parts are available and correct before submitting the discrepancy reports. For an accurate packing list, refer to the owner's manual in the box. If the owner's manual doesn't have a packing list, enter the assembly part number (<strong>${esc(l.item)}</strong>) in the LMI Parts Tool.</p>
+      <div class="noteField">Add the rest of the parts needed<div id="needRows">${s.needs.map(needRow).join('')}</div></div>
+      <div class="actionsBar">${t.lines.some(x => x.picked > 0) ? '<button data-act="moreProblems">Another item has a problem</button>' : ''}<button class="primary" data-act="toReports">Go to the reports</button></div></div>`;
   } else if (s.kind === 'name') {
     el.innerHTML = `<div class="sheetBody" role="dialog" aria-modal="true" aria-labelledby="sheetTitle"><h2 id="sheetTitle">Add your name</h2>
       <p class="muted">It's saved on this iPad so you can pick it from the list next time.</p>
@@ -602,21 +629,50 @@ function barcodeBeside(page, form, name, right) {
 }
 
 function completeOrder(t) {
-  t.status = 'done'; t.completedAt = now(); stamp(t, 'Saved with no discrepancies'); save();
+  t.status = 'done'; t.completedAt = now(); stamp(t, t.madeWhole ? 'Conversion finished with the parts received' : 'Saved with no discrepancies'); save();
   go('home', null); toast(`Order ${t.orderNumber} saved. On to the next one.`);
 }
 
-// Yes or No on a conversion question. The answer that means a discrepancy records it, then the reports print.
+// Yes or No on a conversion question. The answer that means a discrepancy records it, then asks for anything else
+// missing or wrong, so every missing piece is on the reports the first time round (john 2026-10-29).
 function answer(yes) {
   const t = current(), s = convSteps(t)[t.conv.step];
   stamp(t, `${s.text} ${yes ? 'Yes' : 'No'}`);
   if ((s.problemIf === 'yes') !== yes) { t.conv.step++; save(); return go('convert'); }
   save();
-  const picked = t.lines.filter(l => l.picked > 0);
   if (s.line && s.line.picked > 0) return openProblem(s.line, true, 'reports');
+  chooseProblem(t);
+}
+// A conversion problem on any checked part: the parts to choose from, or the only one. again: the "Anything else?"
+// step to come back to.
+function chooseProblem(t, again = null) {
+  const picked = t.lines.filter(l => l.picked > 0);
   if (!picked.length) return go('reports');
-  view.sheet = { kind: 'problem', lineId: picked.length === 1 ? picked[0].id : null, type: '', qty: picked.length === 1 ? Math.min(1, picked[0].picked) : 0, picked: true, then: 'reports', choose: picked.map(l => l.id) };
+  view.sheet = { kind: 'problem', lineId: picked.length === 1 ? picked[0].id : null, type: '', qty: picked.length === 1 ? Math.min(1, picked[0].picked) : 0, picked: true, then: 'reports', again, choose: picked.map(l => l.id) };
   renderSheet();
+}
+const cleanNeeds = needs => (needs || []).filter(n => n.part.trim()).map(n => ({ part: n.part.trim().replace(/\s+/g, ' '), qty: +n.qty > 0 ? +n.qty : '' }));
+const moreStep = (l, type) => ({ kind: 'more', lineId: l.id, type, needs: [{ part: '', qty: '' }] });
+// The parts added on the "Anything else?" step join the problem just recorded.
+function keepMoreNeeds() {
+  const s = view.sheet, t = current(), l = lineById(s.lineId), p = l && l.problems.find(x => x.type === s.type), needs = cleanNeeds(s.needs);
+  if (!p || !needs.length) return;
+  p.needs = (p.needs || []).concat(needs);
+  stamp(t, `${l.item}: parts needed ${needs.map(needText).join(', ')}`); save();
+}
+
+// The parts came in: the problems they make good come off the order (kept in madeWhole for the record) and the
+// conversion carries on from the step where it stopped.
+function resume(t) {
+  for (const l of t.lines) {
+    const fixed = l.problems.filter(p => (p.needs || []).length);
+    for (const p of fixed) { (t.madeWhole = t.madeWhole || []).push({ item: l.item, type: p.type, qty: p.qty, needs: p.needs }); l.picked += p.qty; }
+    l.problems = l.problems.filter(p => !fixed.includes(p));
+  }
+  t.waiting = null;
+  if (!t.conv) t.conv = { step: 0 };
+  stamp(t, 'Parts received, conversion continued'); save();
+  go(hasProblems(t) ? 'reports' : 'convert');
 }
 
 const actions = {
@@ -671,15 +727,24 @@ const actions = {
     if (!s.type || !(qty > 0)) return;
     if (s.picked) l.picked -= qty;
     const note = (s.note || '').trim().replace(/\s+/g, ' ');
+    const needs = cleanNeeds(s.needs);
     const same = l.problems.find(p => p.type === s.type);
-    if (same) { same.qty += qty; if (note) same.note = same.note ? `${same.note}; ${note}` : note; }
-    else l.problems.push({ type: s.type, qty, note });
-    stamp(t, `${l.item}: ${fmtQty(qty)} ${s.type.toLowerCase()}${s.picked ? ' (found in the conversion)' : ''}${note ? '. Note: ' + note : ''}`);
-    // A problem on part of a line leaves the rest to pick; a full-line problem finishes the line.
-    save(); view.sheet = null;
-    if (s.then === 'reports') go('reports'); else render();
+    if (same) { same.qty += qty; if (note) same.note = same.note ? `${same.note}; ${note}` : note; same.needs = (same.needs || []).concat(needs); }
+    else l.problems.push({ type: s.type, qty, note, needs });
+    stamp(t, `${l.item}: ${fmtQty(qty)} ${s.type.toLowerCase()}${s.picked ? ' (found in the conversion)' : ''}${needs.length ? '. Parts needed: ' + needs.map(needText).join(', ') : ''}${note ? '. Note: ' + note : ''}`);
+    // A problem on part of a line leaves the rest to check; a full-line problem finishes the line.
+    save(); view.sheet = s.then === 'reports' ? moreStep(l, s.type) : null;
+    render();
   },
-  closeSheet: () => { view.sheet = null; renderSheet(); },
+  // Leaving "Anything else?" goes to the reports, and leaving the next problem goes back to it, so a recorded
+  // conversion problem never strands the order mid-step.
+  closeSheet: () => {
+    const s = view.sheet;
+    if (s && s.kind === 'more') return actions.toReports();
+    view.sheet = s && s.again ? s.again : null; renderSheet();
+  },
+  moreProblems: () => { const s = view.sheet; keepMoreNeeds(); chooseProblem(current(), moreStep(lineById(s.lineId), s.type)); },
+  toReports: () => { keepMoreNeeds(); go('reports'); },
   saveName: () => {
     const name = ($('#newName').value || '').trim().replace(/\s+/g, ' ');
     if (!name) return toast('Type your name first.');
@@ -696,6 +761,7 @@ const actions = {
     if (!allDone(t)) return toast('Check every line first.');
     if (!t.picker) return toast('Choose your name first.');
     const step = nextStep(t);
+    if (step === 'resume') return resume(t);
     if (step !== 'convert') { stamp(t, 'Items checked'); save(); return step === 'reports' ? go('reports') : completeOrder(t); }
     if (!t.conv) { t.conv = { step: 0 }; stamp(t, 'Conversion started'); save(); }
     go('convert');
@@ -717,11 +783,12 @@ const actions = {
   backToTicket: () => go('ticket'),
   print: () => {
     const t = current();
-    const first = t.status !== 'done';
-    if (first) { t.status = 'done'; t.completedAt = now(); stamp(t, 'Reports printed, pick ticket completed'); save(); }
+    const first = t.status !== 'done', wait = first && canWait(t);
+    if (wait) { t.waiting = now(); stamp(t, 'Taker report printed, waiting for parts'); save(); }
+    else if (first) { t.status = 'done'; t.completedAt = now(); stamp(t, 'Reports printed, pick ticket completed'); save(); }
     $('#printArea').innerHTML = printHtml(t);
-    render();
-    if (embedded) toast(first ? 'Pick ticket completed. Print from the installed iPad app.' : 'Printing works in the installed iPad app.');
+    if (wait) go('ticket'); else render();
+    if (embedded) toast(wait ? 'Saved as Waiting for parts. Print from the installed iPad app.' : first ? 'Pick ticket completed. Print from the installed iPad app.' : 'Printing works in the installed iPad app.');
     else setTimeout(() => window.print(), 100);
   },
   makeLabels: async b => {
@@ -863,6 +930,11 @@ document.addEventListener('input', e => {
     save();
   }
   else if (el.id === 'pNote' && view.sheet) view.sheet.note = el.value;
+  else if (el.dataset.need && view.sheet) {
+    const needs = view.sheet.needs, i = +el.dataset.need;
+    needs[i][el.dataset.key] = el.value;
+    if (i === needs.length - 1 && needs[i].part.trim()) { needs.push({ part: '', qty: '' }); $('#needRows').insertAdjacentHTML('beforeend', needRow(needs[i + 1], i + 1)); }
+  }
 });
 $('#sheet').addEventListener('click', e => { if (e.target.id === 'sheet') actions.closeSheet(); });
 $('#toast').addEventListener('click', e => { e.currentTarget.hidden = true; });
