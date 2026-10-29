@@ -66,6 +66,15 @@ const nextStep = t => t.waiting ? 'resume' : hasProblems(t) ? 'reports' : isConv
 // waits for the parts at the step where it stopped instead of completing (john 2026-10-29).
 const canWait = t => isConversion(t) && hasProblems(t) && ticketProblems(t).every(p => (p.needs || []).length);
 const partsAwaited = t => ticketProblems(t).flatMap(p => (p.needs || []).map(needText)).join(', ');
+const qtyList = xs => xs.map(x => `${fmtQty(x.qty)} × ${x.item}`).join(', ');
+const responseText = t => { const r = t.response; return `The Taker responded: pick ticket ${esc(r.ticket)} replaces the first one.${r.added.length ? ` Added: ${esc(qtyList(r.added))}.` : ''}${r.removed.length ? ` Taken off: ${esc(qtyList(r.removed))}.` : ''} Check what came in, then tap Continue conversion.`; };
+// What the corrected pick ticket says about a problem waiting on parts: its parts needed were added ('parts'), or the
+// item itself was taken off, so another one replaces it ('other'). '' when it can't tell, and the inspector is asked.
+function cameFor(t, p) {
+  const r = t.response; if (!r) return '';
+  const added = new Set(r.added.map(x => x.item)), parts = p.needs.every(n => added.has(n.part.toUpperCase())), off = r.removed.some(x => x.item === p.line.item.toUpperCase());
+  return parts && !off ? 'parts' : off && !parts ? 'other' : '';
+}
 
 function newTicketFrom(draft) {
   return {
@@ -76,6 +85,21 @@ function newTicketFrom(draft) {
     lines: draft.lines.map(l => ({ id: uid(), item: l.item.trim(), desc: l.desc.trim(), bin: (l.bin || '').trim(), qty: +l.qty, product: l.product || '', picked: 0, problems: [] })),
     labels: (draft.products || []).filter(p => p.kind === 'conversion').flatMap(p => Array.from({ length: Math.max(1, Math.round(p.qty)) }, (_, i) => ({ id: uid(), product: p.item, unit: i + 1, of: Math.max(1, Math.round(p.qty)), ...P.labelDefaults(p) })))
   };
+}
+
+// A corrected pick ticket for an order waiting for parts joins that order instead of becoming a second card: to add to a
+// BOM the Taker cancels the first ticket in P21 and makes a new one (john 2026-10-29). The order is marked as responded
+// to, with what the new ticket added or took off. Returns the ticket the new one ended up as.
+function addTicket(t) {
+  const w = db.tickets.find(x => x.waiting && x.orderNumber === t.orderNumber && x.ticket !== t.ticket);
+  if (!w) { db.tickets.push(t); return t; }
+  const count = lines => lines.reduce((m, l) => m.set(l.item.toUpperCase(), (m.get(l.item.toUpperCase()) || 0) + l.qty), new Map());
+  const was = count(w.lines), got = count(t.lines);
+  const more = (a, b) => [...a].filter(([k, q]) => q > (b.get(k) || 0)).map(([item, q]) => ({ item, qty: q - (b.get(item) || 0) }));
+  w.response = { ticket: t.ticket, added: more(got, was), removed: more(was, got) };
+  stamp(w, `Pick ticket ${t.ticket} came in for this order, replacing ${w.ticket}`);
+  w.ticket = t.ticket;
+  return w;
 }
 
 // Why a ticket can't be saved yet, or '' when it's ready.
@@ -133,7 +157,7 @@ function render() {
 }
 
 function stateLabel(t) {
-  if (t.waiting) return 'Waiting for parts';
+  if (t.waiting) return t.response ? 'Taker responded' : 'Waiting for parts';
   if (!allDone(t)) return `${pickedCount(t)} of ${t.lines.length} lines`;
   if (nextStep(t) !== 'convert') return nextStep(t) === 'reports' ? 'Ready to print reports' : 'Ready to save';
   return t.conv ? `Conversion step ${t.conv.step + 1} of ${convSteps(t).length}` : 'Ready to convert';
@@ -144,15 +168,15 @@ function homeView() {
   const done = db.tickets.filter(t => t.status === 'done').sort((a, b) => b.completedAt.localeCompare(a.completedAt));
   const card = t => {
     const probs = ticketProblems(t).length;
-    return `<button class="ticketCard" data-act="open" data-id="${t.id}">
+    return `<button class="ticketCard${t.waiting ? (t.response ? ' responded' : ' waiting') : ''}" data-act="open" data-id="${t.id}">
       <span class="tcMain"><span class="tcOrder">Order ${esc(t.orderNumber)}</span><span class="tcSub">Pick ticket ${esc(t.ticket)} · ${esc(t.type)}${t.customer ? ' · ' + esc(t.customer) : ''}</span></span>
       <span class="tcState">${t.status === 'done'
         ? `<span class="chip ${probs ? 'warn' : 'ok'}">${probs ? probs + ' discrepanc' + (probs === 1 ? 'y' : 'ies') : 'Complete'}</span><small>${esc(fmtDate(t.completedAt))}${t.picker ? ' · ' + esc(t.picker) : ''}</small>`
         : `<span class="chip">${esc(stateLabel(t))}</span><small>${t.picker ? esc(t.picker) : 'Not started'}</small>`}</span>
     </button>`;
   };
-  const waiting = view.pending.length;
-  return `${waiting ? `<div class="note strong pending"><span>${waiting === 1 ? '1 new pick ticket from the folder needs' : `${waiting} new pick tickets from the folder need`} checking.</span><button data-act="checkPending">Check ${waiting === 1 ? 'it' : 'them'}</button></div>` : ''}
+  const waiting = view.pending.length, responded = open.filter(t => t.waiting && t.response);
+  return `${responded.length ? `<p class="note responded">The Taker responded on order ${responded.map(t => esc(t.orderNumber)).join(', ')}. Open ${responded.length === 1 ? 'it' : 'them'} to continue the conversion.</p>` : ''}${waiting ? `<div class="note strong pending"><span>${waiting === 1 ? '1 new pick ticket from the folder needs' : `${waiting} new pick tickets from the folder need`} checking.</span><button data-act="checkPending">Check ${waiting === 1 ? 'it' : 'them'}</button></div>` : ''}
     <section class="start">
       <button class="big primary" data-act="import"><span class="bigIcon" aria-hidden="true">⇪</span>Import pick tickets<small>One PDF or several at once</small></button>
       <button class="big" data-act="manual"><span class="bigIcon" aria-hidden="true">✎</span>Enter by hand<small>When a PDF won't import</small></button>
@@ -232,7 +256,7 @@ function ticketView(t) {
     <details class="panel orderDetails"><summary>Order details</summary>${orderBlock(t)}${t.service ? `<p class="muted">Service item: ${esc(t.service)}</p>` : ''}</details>
     ${t.products.length ? `<div class="panel builds">${t.products.map(p => `<p><span class="chip">${p.kind === 'conversion' ? 'Conversion' : 'Assembly'}</span> <strong>${esc(p.item)}</strong> × ${fmtQty(p.qty)}</p>${p.returns.length ? `<p class="muted">Removed and returned to stock: ${p.returns.map(r => esc(r.item) + ' × ' + fmtQty(r.qty)).join(', ')}</p>` : ''}`).join('')}</div>` : ''}
     ${needPicker ? '<p class="note strong">Choose your name above before checking the items.</p>' : ''}
-    ${t.waiting ? `<p class="note strong">Waiting for parts: ${esc(partsAwaited(t))}. Once you receive the parts, tap Continue conversion.</p>` : ''}
+    ${t.waiting ? (t.response ? `<p class="note responded">${responseText(t)}</p>` : `<p class="note strong">Waiting for parts: ${esc(partsAwaited(t))}. Once you receive the parts, tap Continue conversion.</p>`) : ''}
     <div class="progress" role="progressbar" aria-valuemin="0" aria-valuemax="${t.lines.length}" aria-valuenow="${done}"><div style="width:${t.lines.length ? done / t.lines.length * 100 : 0}%"></div></div>
     <p class="progressText">${done} of ${t.lines.length} lines done${probs ? ` · <span class="warnText">${probs} discrepanc${probs === 1 ? 'y' : 'ies'}</span>` : ''}</p>
     <ol class="lines ${needPicker ? 'locked' : ''}">${t.lines.map(l => lineRow(l, needPicker)).join('')}</ol>
@@ -349,11 +373,11 @@ function takerText(t) {
   return lines.join('\n');
 }
 const emailButton = t => `<a class="btn" href="${esc('googlegmail:///co?subject=' + encodeURIComponent(`Order ${t.orderNumber} / Pick ticket ${t.ticket} - Taker report`) + '&body=' + encodeURIComponent(takerText(t)))}">Email Taker report</a>`;
-function adjustmentReport(t) {
-  if (!adjustProblems(t).length) return '';
+function adjustmentReport(t, problems = adjustProblems(t)) {
+  if (!problems.length) return '';
   return `<section class="report">${reportHeader(t, 'Inventory adjustment report')}
     <table class="rTable"><thead><tr><th>Item</th><th class="num">Qty</th><th>Bin</th><th>Discrepancy</th></tr></thead>
-    ${reportRows(adjustProblems(t), p => `<td><strong>${esc(p.line.item)}</strong></td><td class="num">${fmtQty(p.qty)}</td><td>${esc(p.line.bin)}</td><td>${esc(p.type)}</td>`, false)}
+    ${reportRows(problems, p => `<td><strong>${esc(p.line.item)}</strong></td><td class="num">${fmtQty(p.qty)}</td><td>${esc(p.line.bin)}</td><td>${esc(p.type)}</td>`, false)}
     </table></section>`;
 }
 const reportsHtml = t => takerReport(t) + adjustmentReport(t);
@@ -377,11 +401,15 @@ function reportsView(t) {
     </div>`;
 }
 
+const madeWholeText = t => {
+  const parts = t.madeWhole.filter(m => !m.replaced).flatMap(m => m.needs.map(needText)), swapped = t.madeWhole.filter(m => m.replaced).map(m => m.item);
+  return (parts.length ? ` Made whole with the parts received: ${esc(parts.join(', '))}.` : '') + (swapped.length ? ` Replaced with a different one off the shelf: ${esc(swapped.join(', '))}.` : '');
+};
 // A pick ticket finished with no discrepancies: nothing was printed.
 function cleanView(t) {
   const back = returnsOf(t).filter(r => r.bin);
   return `<div class="pageHead"><div><p class="eyebrow">Completed ${esc(fmtDate(t.completedAt))}</p><h1>Order ${esc(t.orderNumber)} · ${esc(t.ticket)}</h1></div></div>
-    <p class="note">Completed by ${esc(t.picker || 'the inspector')}${t.madeWhole ? `. Made whole with the parts received: ${esc(t.madeWhole.flatMap(p => p.needs.map(needText)).join(', '))}.` : ' with no discrepancies, so there are no reports to print.'}</p>
+    <p class="note">Completed by ${esc(t.picker || 'the inspector')}${t.madeWhole ? '.' + madeWholeText(t) : ' with no discrepancies, so there are no reports to print.'}</p>
     <div class="panel">${orderBlock(t)}${back.length ? `<p class="returned">Returned to inventory: ${back.map(r => `<strong>${esc(r.item)}</strong> in bin <strong>${esc(r.bin)}</strong>`).join(', ')}</p>` : ''}</div>
     <div class="actionsBar">${deleteButton(t)}<button data-act="home">Back to tickets</button></div>`;
 }
@@ -494,7 +522,7 @@ async function pickup(force = false) {
       if (d.plain) { plain++; markSeen(f.Id); }
       else if (d.ticket.trim() && db.tickets.some(t => t.ticket === d.ticket.trim())) markSeen(f.Id);
       else if (draftProblem(d) || d.lines.some(l => !String(l.item).trim())) check.push(d);
-      else { const t = newTicketFrom(d); stamp(t, 'Picked up from the Pick Tickets folder'); db.tickets.push(t); save(); markSeen(f.Id); added++; }
+      else { const t = newTicketFrom(d); stamp(t, 'Picked up from the Pick Tickets folder'); addTicket(t); save(); markSeen(f.Id); added++; }
     }
   } catch (e) { console.error(e); }
   finally { pickingUp = false; }
@@ -545,6 +573,12 @@ function renderSheet() {
       <p>Verify the rest of the parts are available and correct before submitting the discrepancy reports. For an accurate packing list, refer to the owner's manual in the box. If the owner's manual doesn't have a packing list, enter the assembly part number (<strong>${esc(l.item)}</strong>) in the LMI Parts Tool.</p>
       <div class="noteField">Add the rest of the parts needed<div id="needRows">${s.needs.map(needRow).join('')}</div></div>
       <div class="actionsBar">${t.lines.some(x => x.picked > 0) ? '<button data-act="moreProblems">Another item has a problem</button>' : ''}<button class="primary" data-act="toReports">Go to the reports</button></div></div>`;
+  } else if (s.kind === 'came') {
+    const t = ticketById(view.id), q = s.todo[0], l = t.lines.find(x => x.id === q.lineId), p = l.problems.find(x => x.type === q.type);
+    el.innerHTML = `<div class="sheetBody" role="dialog" aria-modal="true" aria-labelledby="sheetTitle"><h2 id="sheetTitle">What came in for ${esc(l.item)}?</h2>
+      <p>Parts needed: <strong>${esc(p.needs.map(needText).join(', '))}</strong></p>
+      <p class="muted">A different ${esc(l.item)} off the shelf prints 2 copies of the inventory adjustment report for the original one. Attach 1 copy to it and place it in the designated area. Give the other copy to the inventory adjuster.</p>
+      <div class="actionsBar"><button data-act="cameOther">A different ${esc(l.item)}</button><button class="primary" data-act="cameParts">The parts needed</button></div></div>`;
   } else if (s.kind === 'name') {
     el.innerHTML = `<div class="sheetBody" role="dialog" aria-modal="true" aria-labelledby="sheetTitle"><h2 id="sheetTitle">Add your name</h2>
       <p class="muted">It's saved on this iPad so you can pick it from the list next time.</p>
@@ -671,18 +705,36 @@ function keepMoreNeeds() {
   stamp(t, `${l.item}: parts needed ${needs.map(needText).join(', ')}`); save();
 }
 
-// The parts came in: the problems they make good come off the order (kept in madeWhole for the record) and the
-// conversion carries on from the step where it stopped.
-function resume(t) {
-  for (const l of t.lines) {
-    const fixed = l.problems.filter(p => (p.needs || []).length);
-    for (const p of fixed) { (t.madeWhole = t.madeWhole || []).push({ item: l.item, type: p.type, qty: p.qty, needs: p.needs }); l.picked += p.qty; }
-    l.problems = l.problems.filter(p => !fixed.includes(p));
+// The parts are in. For each problem waiting on parts, the Taker sent either the parts needed or a different one of
+// that item off the shelf (john 2026-10-29). The corrected pick ticket tells which; otherwise ask, one problem at a time.
+function askCame(t) {
+  const fixed = ticketProblems(t).filter(p => (p.needs || []).length), key = p => ({ lineId: p.line.id, type: p.type });
+  const todo = fixed.filter(p => !cameFor(t, p)).map(key), swap = fixed.filter(p => cameFor(t, p) === 'other').map(key);
+  if (!todo.length) return resume(t, swap);
+  view.sheet = { kind: 'came', todo, swap }; renderSheet();
+}
+// The problems come off the order (kept in madeWhole for the record) and the conversion carries on from the step where
+// it stopped. An item replaced off the shelf leaves the original deficient, so its inventory report prints.
+function resume(t, swap = []) {
+  const fixed = ticketProblems(t).filter(p => (p.needs || []).length), swapped = p => swap.some(q => q.lineId === p.line.id && q.type === p.type);
+  const out = fixed.filter(swapped);
+  if (out.length) { $('#printArea').innerHTML = adjustmentReport(t, out).repeat(2); stamp(t, `Replaced off the shelf: ${out.map(p => p.line.item).join(', ')}. Inventory report printed`); }
+  for (const p of fixed) {
+    (t.madeWhole = t.madeWhole || []).push({ item: p.line.item, type: p.type, qty: p.qty, needs: p.needs, replaced: swapped(p) });
+    p.line.picked += p.qty;
+    p.line.problems = p.line.problems.filter(x => x.type !== p.type);
   }
   t.waiting = null;
   if (!t.conv) t.conv = { step: 0 };
   stamp(t, 'Parts received, conversion continued'); save();
   go(hasProblems(t) ? 'reports' : 'convert');
+  if (out.length) { if (embedded) toast('Printing works in the installed iPad app.'); else setTimeout(() => window.print(), 100); }
+}
+function cameAnswer(other) {
+  const s = view.sheet, q = s.todo.shift();
+  if (other) s.swap.push(q);
+  if (s.todo.length) return renderSheet();
+  resume(current(), s.swap);
 }
 
 const actions = {
@@ -711,10 +763,10 @@ const actions = {
     const dup = db.tickets.find(t => t.ticket === d.ticket.trim());
     if (dup) return toast(`Pick ticket ${d.ticket} is already saved${dup.status === 'done' ? ' and completed' : ''}.`);
     const t = newTicketFrom(d); stamp(t, d.fromPdf ? 'Imported from PDF' : 'Entered by hand');
-    db.tickets.push(t); save();
+    const kept = addTicket(t); save();
     settled(d);
-    if (view.queue) actions.nextDraft(null, `Pick ticket ${t.ticket} added to In progress.`);
-    else { view.draft = null; go('ticket', t.id); }
+    if (view.queue) actions.nextDraft(null, kept === t ? `Pick ticket ${t.ticket} added to In progress.` : `Pick ticket ${t.ticket} joined order ${t.orderNumber}, which was waiting for parts.`);
+    else { view.draft = null; go('ticket', kept.id); }
   },
   // After several PDFs came in at once: the next one that needs checking, or home when none are left.
   nextDraft: (b, note = '') => {
@@ -753,6 +805,8 @@ const actions = {
     if (s && s.kind === 'more') return actions.toReports();
     view.sheet = s && s.again ? s.again : null; renderSheet();
   },
+  cameParts: () => cameAnswer(false),
+  cameOther: () => cameAnswer(true),
   moreProblems: () => { const s = view.sheet; keepMoreNeeds(); chooseProblem(current(), moreStep(lineById(s.lineId), s.type)); },
   toReports: () => { keepMoreNeeds(); go('reports'); },
   saveName: () => {
@@ -771,7 +825,7 @@ const actions = {
     if (!allDone(t)) return toast('Check every line first.');
     if (!t.picker) return toast('Choose your name first.');
     const step = nextStep(t);
-    if (step === 'resume') return resume(t);
+    if (step === 'resume') return askCame(t);
     if (step !== 'convert') { stamp(t, 'Items checked'); save(); return step === 'reports' ? go('reports') : completeOrder(t); }
     if (!t.conv) { t.conv = { step: 0 }; stamp(t, 'Conversion started'); save(); }
     go('convert');
@@ -906,7 +960,7 @@ async function importPdfs(files) {
       if (d.plain) plain++;
       else if (d.ticket.trim() && db.tickets.some(t => t.ticket === d.ticket.trim())) already++;
       else if (draftProblem(d) || d.lines.some(l => !String(l.item).trim())) check.push(d);
-      else { const t = newTicketFrom(d); stamp(t, 'Imported from PDF'); db.tickets.push(t); added++; }
+      else { const t = newTicketFrom(d); stamp(t, 'Imported from PDF'); addTicket(t); added++; }
     }
   } finally { importing = false; }
   save();

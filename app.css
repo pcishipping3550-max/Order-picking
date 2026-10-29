@@ -4,6 +4,7 @@
   --accent: #0e5e52; --accent-ink: #ffffff; --accent-soft: #dcefe9;
   --ok: #2e7d4f; --ok-bg: #e3f3e8; --warn: #9a5208; --warn-bg: #fcefd9; --bad: #b42318;
   --tag: #ffe873; --tag-ink: #2a2405;
+  --wait-bg: #fff4bf; --wait-line: #d9ae00; --wait-ink: #1c1802; --resp-bg: #dce9fb; --resp-line: #2f6fbd; --resp-ink: #ffffff;
   --font-ui: -apple-system, BlinkMacSystemFont, "SF Pro Text", "Segoe UI", Roboto, "Helvetica Neue", sans-serif;
   --font-num: ui-monospace, "SF Mono", Menlo, Consolas, "Liberation Mono", monospace;
   --r: 10px;
@@ -15,6 +16,7 @@
     --accent: #4fb3a1; --accent-ink: #062019; --accent-soft: #173a34;
     --ok: #6bcf96; --ok-bg: #16301f; --warn: #f2ab57; --warn-bg: #36260f; --bad: #ff8a80;
     --tag: #e3c93a; --tag-ink: #1c1802; color-scheme: dark;
+    --wait-bg: #3a320c; --wait-line: #e3c93a; --wait-ink: #1c1802; --resp-bg: #13263d; --resp-line: #7fb0ec; --resp-ink: #0b1a2b;
   }
 }
 :root[data-theme="dark"] {
@@ -22,6 +24,7 @@
   --accent: #4fb3a1; --accent-ink: #062019; --accent-soft: #173a34;
   --ok: #6bcf96; --ok-bg: #16301f; --warn: #f2ab57; --warn-bg: #36260f; --bad: #ff8a80;
   --tag: #e3c93a; --tag-ink: #1c1802; color-scheme: dark;
+  --wait-bg: #3a320c; --wait-line: #e3c93a; --wait-ink: #1c1802; --resp-bg: #13263d; --resp-line: #7fb0ec; --resp-ink: #0b1a2b;
 }
 [hidden] { display: none !important; }
 * { box-sizing: border-box; }
@@ -91,6 +94,12 @@ textarea { resize: vertical; }
 .listHead span { font-variant-numeric: tabular-nums; }
 .list { display: grid; gap: .6rem; }
 .ticketCard { display: flex; flex-wrap: wrap; align-items: center; justify-content: space-between; gap: .5rem 1rem; text-align: left; padding: .85rem 1rem; border-radius: 14px; }
+/* An order waiting for parts is yellow on the list, and blue once the Taker's corrected pick ticket is in (john). */
+.ticketCard.waiting { background: var(--wait-bg); border-color: var(--wait-line); }
+.ticketCard.responded { background: var(--resp-bg); border-color: var(--resp-line); }
+.ticketCard.waiting .chip { background: var(--wait-line); color: var(--wait-ink); }
+.ticketCard.responded .chip { background: var(--resp-line); color: var(--resp-ink); }
+.note.responded { background: var(--resp-bg); border: 1px solid var(--resp-line); }
 .tcMain, .tcState { display: flex; flex-direction: column; gap: .15rem; min-width: 0; }
 .tcState { align-items: flex-end; }
 .tcOrder { font-size: 1.1rem; font-family: var(--font-num); }
