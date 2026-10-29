@@ -19,7 +19,9 @@ self.addEventListener('fetch', e => {
   const key = req.mode === 'navigate' ? 'index.html' : req, path = req.mode === 'navigate' ? 'index.html' : new URL(req.url).pathname;
   e.respondWith(caches.open(CACHE).then(async cache => {
     const hit = await cache.match(key, { ignoreSearch: true });
-    const fresh = fetch(req).then(async res => { if (await genuine(res, path)) await cache.put(key, res.clone()); return res; }).catch(() => null);
+    // The refresh asks the server, not the browser's own copy (GitHub Pages lets browsers keep files for 10 minutes),
+    // so an update shows on the next open.
+    const fresh = fetch(hit ? new Request(req.url, { cache: 'no-cache' }) : req).then(async res => { if (await genuine(res, path)) await cache.put(key, res.clone()); return res; }).catch(() => null);
     if (hit) { e.waitUntil(fresh); return hit; }
     return (await fresh) || new Response('Offline', { status: 503 });
   }));
