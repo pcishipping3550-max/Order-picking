@@ -1,9 +1,10 @@
 'use strict';
 // Assemblies & Conversions: one pick ticket at a time, on one iPad, offline.
-// Pick → inspect (a conversion's own steps start with that check) → print reports only when there are discrepancies.
+// Shipping picks; here each item is checked off one at a time, then a conversion's steps, and reports print only
+// when there are discrepancies (john 2026-10-29).
 const P = TicketParser;
 const PROBLEMS = ['Damaged', 'Incomplete package', 'Not available'];
-const AFTER_PICK = ['Damaged', 'Incomplete package']; // what an inspection or a conversion can find in parts already picked
+const AFTER_PICK = ['Damaged', 'Incomplete package']; // what a conversion can find in parts already checked
 const STORE = 'ac-picking-v1';
 // The Power Automate flows' web addresses work like passwords, so they stay on this iPad, out of the ticket store and backups.
 const FLOW = 'ac-picking-flow', FILEFLOW = 'ac-picking-fileflow', SEEN = 'ac-picking-seen';
@@ -54,20 +55,13 @@ const ticketProblems = t => t.lines.flatMap(l => l.problems.map(p => ({ line: l,
 const hasProblems = t => ticketProblems(t).length > 0;
 const allDone = t => t.lines.length > 0 && t.lines.every(lineDone);
 const pickedCount = t => t.lines.filter(lineDone).length;
-// A bin the order didn't print stays a blank for the picker to fill in, even after they type it.
-const blankBin = l => !!l.binBlank || !l.bin;
-function sortedLines(t) {
-  const key = l => l.bin.split(' / ')[0];
-  return [...t.lines].sort((a, b) => blankBin(b) - blankBin(a)
-    || (blankBin(a) ? 0 : key(a).localeCompare(key(b), undefined, { numeric: true, sensitivity: 'base' }))
-    || a.item.localeCompare(b.item, undefined, { numeric: true }));
-}
 const labelsLeft = t => t.labels.filter(c => !c.madeAt).length;
 const fmtQty = n => Number.isInteger(n) ? String(n) : String(+n.toFixed(3));
 const isConversion = t => t.products.some(p => p.kind === 'conversion');
 const returnsOf = t => t.products.flatMap(p => p.returns || []);
-// A conversion's steps begin with opening the packages, so they replace the inspection. Discrepancies stop the conversion.
-const nextStep = t => isConversion(t) && !hasProblems(t) ? 'convert' : 'inspect';
+// Once every item is checked: the reports when something is wrong (that stops a conversion), else a conversion's steps,
+// else the order is done.
+const nextStep = t => hasProblems(t) ? 'reports' : isConversion(t) ? 'convert' : 'save';
 
 function newTicketFrom(draft) {
   return {
@@ -75,7 +69,7 @@ function newTicketFrom(draft) {
     type: draft.type, orderNumber: draft.orderNumber.trim(), ticket: draft.ticket.trim(), taker: draft.taker.trim(),
     customer: draft.customer.trim(), customerId: (draft.customerId || '').trim(), billTo: draft.billTo.trim(), shipTo: draft.shipTo.trim(), service: (draft.service || '').trim(),
     products: (draft.products || []).map(p => ({ ...p, returns: (p.returns || []).map(r => ({ ...r, bin: (r.bin || '').trim(), binBlank: !(r.bin || '').trim() })) })),
-    lines: draft.lines.map(l => ({ id: uid(), item: l.item.trim(), desc: l.desc.trim(), bin: (l.bin || '').trim(), binBlank: !(l.bin || '').trim(), qty: +l.qty, product: l.product || '', picked: 0, problems: [] })),
+    lines: draft.lines.map(l => ({ id: uid(), item: l.item.trim(), desc: l.desc.trim(), bin: (l.bin || '').trim(), qty: +l.qty, product: l.product || '', picked: 0, problems: [] })),
     labels: (draft.products || []).filter(p => p.kind === 'conversion').flatMap(p => Array.from({ length: Math.max(1, Math.round(p.qty)) }, (_, i) => ({ id: uid(), product: p.item, unit: i + 1, of: Math.max(1, Math.round(p.qty)), ...P.labelDefaults(p) })))
   };
 }
@@ -126,7 +120,6 @@ function render() {
   const main = $('#main'), t = ticketById(view.id);
   if (view.screen === 'review') main.innerHTML = reviewView();
   else if (view.screen === 'ticket' && t) main.innerHTML = ticketView(t);
-  else if (view.screen === 'inspect' && t) main.innerHTML = inspectView(t);
   else if (view.screen === 'convert' && t && t.conv) main.innerHTML = convertView(t);
   else if (view.screen === 'reports' && t) main.innerHTML = reportsView(t);
   else if (view.screen === 'settings') main.innerHTML = settingsView();
@@ -137,7 +130,7 @@ function render() {
 
 function stateLabel(t) {
   if (!allDone(t)) return `${pickedCount(t)} of ${t.lines.length} lines`;
-  if (nextStep(t) === 'inspect') return 'Ready to inspect';
+  if (nextStep(t) !== 'convert') return nextStep(t) === 'reports' ? 'Ready to print reports' : 'Ready to save';
   return t.conv ? `Conversion step ${t.conv.step + 1} of ${convSteps(t).length}` : 'Ready to convert';
 }
 
@@ -173,7 +166,7 @@ function reviewView() {
   const more = view.queue && view.queue.length ? ` · ${view.queue.length} more after this one` : '';
   return `<div class="pageHead"><div><p class="eyebrow">${d.fromPdf ? 'Check the import' : 'Enter by hand'}${more}</p><h1>${d.fromPdf ? 'Does this match the paper ticket?' : 'New pick ticket'}</h1></div></div>
     ${view.note ? `<p class="note strong">${esc(view.note)}</p>` : ''}
-    ${d.fromPdf ? `<p class="note">Compare the numbers, bins and quantities with the PDF before saving. Fix anything that's wrong here. A bin left empty becomes a blank for the picker to fill in.${d.unreadable ? ' <strong>No text was found in this PDF, so it may be a scan. Enter the lines by hand.</strong>' : ''}</p>` : ''}
+    ${d.fromPdf ? `<p class="note">Compare the numbers and quantities with the PDF before saving. Fix anything that's wrong here.${d.unreadable ? ' <strong>No text was found in this PDF, so it may be a scan. Enter the lines by hand.</strong>' : ''}</p>` : ''}
     <div class="panel grid">
       ${field('orderNumber', 'Order number', 'inputmode="numeric" required')}
       ${field('ticket', 'Pick ticket number', 'inputmode="numeric" required')}
@@ -184,7 +177,7 @@ function reviewView() {
       ${area('billTo', 'Bill To')}${area('shipTo', 'Ship To')}
     </div>
     ${d.products && d.products.length ? `<div class="panel"><h3>Builds</h3>${d.products.map(p => `<p><strong>${esc(p.item)}</strong> × ${fmtQty(p.qty)} · ${p.kind === 'conversion' ? 'Conversion' : 'Assembly'}${p.returns.length ? ` · returns ${p.returns.map(r => esc(r.item) + ' × ' + fmtQty(r.qty)).join(', ')}` : ''}</p>`).join('')}</div>` : ''}
-    <div class="panel"><h3>Lines to pick <span class="muted">${d.lines.length}</span></h3>
+    <div class="panel"><h3>Lines <span class="muted">${d.lines.length}</span></h3>
       <div class="tableWrap"><table class="edit"><thead><tr><th>Item</th><th>Description</th><th>Qty</th><th>Bin</th><th></th></tr></thead><tbody>
       ${d.lines.map((l, i) => `<tr>
         <td><input id="l-${i}-item" aria-label="Item ${i + 1}" data-line="${i}" data-key="item" value="${esc(l.item)}"></td>
@@ -202,7 +195,7 @@ function reviewView() {
 const ticketLine = t => `<p class="pageSub">Pick ticket <strong>${esc(t.ticket)}</strong></p>`;
 
 function pickerSelect(t) {
-  return `<label class="pickerSel">Picker<select id="pickerSelect" data-act-change="picker">
+  return `<label class="pickerSel">Inspector<select id="pickerSelect" data-act-change="picker">
       <option value="">Choose your name</option>
       ${db.pickers.map(n => `<option ${t.picker === n ? 'selected' : ''}>${esc(n)}</option>`).join('')}
       <option value="__new">＋ Add my name…</option></select></label>`;
@@ -226,59 +219,35 @@ const deleteButton = t => `<button data-act="askDelete" data-id="${t.id}" class=
 
 function ticketView(t) {
   if (t.status === 'done') return reportsView(t);
-  const lines = sortedLines(t), done = pickedCount(t), all = allDone(t), probs = ticketProblems(t).length, left = t.lines.length - done;
-  const needPicker = !t.picker;
+  const done = pickedCount(t), all = allDone(t), probs = ticketProblems(t).length, left = t.lines.length - done;
+  const needPicker = !t.picker, step = nextStep(t);
   const next = !all ? `${left} line${left === 1 ? '' : 's'} left`
-    : nextStep(t) === 'inspect' ? 'Inspect' : t.conv ? `Continue conversion · step ${t.conv.step + 1}` : 'Start conversion';
+    : step === 'reports' ? 'Print reports' : step === 'save' ? 'Save order' : t.conv ? `Continue conversion · step ${t.conv.step + 1}` : 'Start conversion';
   return `<div class="pageHead"><div><p class="eyebrow">${esc(t.type)}${t.customer ? ' · ' + esc(t.customer) : ''}</p><h1>Order ${esc(t.orderNumber)}</h1>${ticketLine(t)}</div>${pickerSelect(t)}</div>
     <details class="panel orderDetails"><summary>Order details</summary>${orderBlock(t)}${t.service ? `<p class="muted">Service item: ${esc(t.service)}</p>` : ''}</details>
     ${t.products.length ? `<div class="panel builds">${t.products.map(p => `<p><span class="chip">${p.kind === 'conversion' ? 'Conversion' : 'Assembly'}</span> <strong>${esc(p.item)}</strong> × ${fmtQty(p.qty)}</p>${p.returns.length ? `<p class="muted">Removed and returned to stock: ${p.returns.map(r => esc(r.item) + ' × ' + fmtQty(r.qty)).join(', ')}</p>` : ''}`).join('')}</div>` : ''}
-    ${needPicker ? '<p class="note strong">Choose your name above before picking.</p>' : ''}
+    ${needPicker ? '<p class="note strong">Choose your name above before checking the items.</p>' : ''}
     <div class="progress" role="progressbar" aria-valuemin="0" aria-valuemax="${t.lines.length}" aria-valuenow="${done}"><div style="width:${t.lines.length ? done / t.lines.length * 100 : 0}%"></div></div>
     <p class="progressText">${done} of ${t.lines.length} lines done${probs ? ` · <span class="warnText">${probs} discrepanc${probs === 1 ? 'y' : 'ies'}</span>` : ''}</p>
-    ${t.lines.some(l => blankBin(l) && !l.bin) ? '<p class="note">The order shows no bin for some lines. Look the bin up on the computer and fill it in.</p>' : ''}
-    <ol class="lines ${needPicker ? 'locked' : ''}">${lines.map(l => lineRow(l, needPicker)).join('')}</ol>
+    <ol class="lines ${needPicker ? 'locked' : ''}">${t.lines.map(l => lineRow(l, needPicker)).join('')}</ol>
     <div class="actionsBar">
       ${deleteButton(t)}
       <button class="primary" data-act="next" ${all && !needPicker ? '' : 'disabled'}>${next}</button>
     </div>`;
 }
 
-function binCell(l, locked) {
-  if (!blankBin(l)) return `<div class="bin">${l.bin.split(' / ').map(b => `<span>${esc(b)}</span>`).join('')}</div>`;
-  return `<div class="bin"><input class="binBlank" id="bin-${l.id}" data-bin="${l.id}" value="${esc(l.bin)}" placeholder="Fill in bin" aria-label="Bin for ${esc(l.item)}" autocapitalize="characters" autocomplete="off" spellcheck="false" ${locked ? 'disabled' : ''}></div>`;
-}
 const probChips = l => l.problems.length ? `<span class="probs">${l.problems.map(p => `<span class="chip warn">${fmtQty(p.qty)} ${esc(p.type.toLowerCase())}</span>${p.note ? `<span class="probNote">${esc(p.note)}</span>` : ''}`).join(' ')}</span>` : '';
 
 function lineRow(l, locked) {
   const rem = remaining(l), done = rem === 0, probs = l.problems;
   const dis = locked ? 'disabled' : '';
   return `<li class="line ${done ? (probs.length ? 'hasProblem' : 'done') : ''}">
-    ${binCell(l, locked)}
     <div class="what"><span class="item">${esc(l.item)}</span><span class="desc">${esc(l.desc)}</span>${probChips(l)}
       ${l.product ? `<span class="muted small">For ${esc(l.product)}</span>` : ''}</div>
-    <div class="qty"><span class="lbl">To pick</span><strong>${fmtQty(l.qty)}</strong>${l.picked && !done ? `<small>${fmtQty(l.picked)} picked</small>` : ''}</div>
+    <div class="qty"><span class="lbl">Qty</span><strong>${fmtQty(l.qty)}</strong>${l.picked && !done ? `<small>${fmtQty(l.picked)} checked</small>` : ''}</div>
     <div class="acts">${done
-      ? `<span class="doneMark">${probs.length ? (l.picked ? fmtQty(l.picked) + ' picked' : 'None picked') : '✓ Picked'}</span><button class="small quiet" data-act="undo" data-id="${l.id}" ${dis}>Undo</button>`
-      : `<button class="pick" data-act="pickAll" data-id="${l.id}" ${dis}>✓ Picked${rem !== l.qty ? ' ' + fmtQty(rem) : ''}</button><button class="problem" data-act="problem" data-id="${l.id}" ${dis}>Problem</button>`}</div>
-  </li>`;
-}
-
-// ---------- inspect ----------
-function inspectView(t) {
-  const probs = hasProblems(t);
-  return `<div class="pageHead"><div><p class="eyebrow">Inspect · ${esc(t.type)}${t.customer ? ' · ' + esc(t.customer) : ''}</p><h1>Order ${esc(t.orderNumber)}</h1>${ticketLine(t)}</div></div>
-    <p class="note">Quick visual check of what you picked: the quantities are correct and nothing is damaged. Tap Problem on anything that isn't right.</p>
-    <ol class="lines">${sortedLines(t).map(inspectRow).join('')}</ol>
-    <div class="actionsBar"><button class="quiet" data-act="backToTicket">‹ Back to picking</button>
-      <button class="primary" data-act="inspectDone">${probs ? 'Inspection done, print reports' : 'Inspection done, save order'}</button></div>`;
-}
-function inspectRow(l) {
-  return `<li class="line ${l.problems.length ? 'hasProblem' : ''}">
-    ${binCell(l, false)}
-    <div class="what"><span class="item">${esc(l.item)}</span><span class="desc">${esc(l.desc)}</span>${probChips(l)}</div>
-    <div class="qty"><span class="lbl">Picked</span><strong>${fmtQty(l.picked)}</strong></div>
-    <div class="acts">${l.picked > 0 ? `<button class="problem" data-act="problemPicked" data-id="${l.id}">Problem</button>` : ''}</div>
+      ? `<span class="doneMark">${probs.length ? (l.picked ? fmtQty(l.picked) + ' OK' : 'None OK') : '✓ Checked'}</span><button class="small quiet" data-act="undo" data-id="${l.id}" ${dis}>Undo</button>`
+      : `<button class="pick" data-act="pickAll" data-id="${l.id}" ${dis}>✓ Checked${rem !== l.qty ? ' ' + fmtQty(rem) : ''}</button><button class="problem" data-act="problem" data-id="${l.id}" ${dis}>Problem</button>`}</div>
   </li>`;
 }
 
@@ -296,7 +265,7 @@ function convertView(t) {
     ${s.key === 'install' ? chartsHtml() : ''}
     ${s.key === 'labels' ? labelCards(t) : ''}
     <div class="actionsBar">
-      <button class="quiet" data-act="${i ? 'convPrev' : 'backToTicket'}">${i ? '‹ Previous step' : '‹ Back to picking'}</button>
+      <button class="quiet" data-act="${i ? 'convPrev' : 'backToTicket'}">${i ? '‹ Previous step' : '‹ Back to the items'}</button>
       ${s.problemIf
         ? '<button class="answer" data-act="convNo">No</button><button class="answer" data-act="convYes">Yes</button>'
         : `<button class="primary" data-act="convDone">${s.key === 'inventory' ? 'Save the order and move on' : 'Done'}</button>`}
@@ -342,7 +311,7 @@ function returnBins(t) {
 function reportHeader(t, title) {
   return `<header class="rHead"><h1>${title}</h1>
     <table class="rMeta"><tr><th>Order</th><td>${esc(t.orderNumber)}</td><th>Pick ticket</th><td>${esc(t.ticket)}</td><th>Type</th><td>${esc(t.type)}</td></tr>
-    <tr><th>Taker</th><td>${esc(t.taker || '—')}</td><th>Picker</th><td>${esc(t.picker || '—')}</td><th>Date</th><td>${esc(fmtDate(t.completedAt || now()))}</td></tr>
+    <tr><th>Taker</th><td>${esc(t.taker || '—')}</td><th>Inspector</th><td>${esc(t.picker || '—')}</td><th>Date</th><td>${esc(fmtDate(t.completedAt || now()))}</td></tr>
     <tr><th>Customer</th><td colspan="3">${esc(t.customer || '—')}</td><th>Customer #</th><td>${esc(t.customerId || '—')}</td></tr></table>
     <div class="rAddr"><div><strong>Bill To</strong><pre>${esc(t.billTo || '—')}</pre></div><div><strong>Ship To</strong><pre>${esc(t.shipTo || '—')}</pre></div></div>
   </header>`;
@@ -378,7 +347,7 @@ function reportsView(t) {
     ${embedded ? '<p class="note">Printing works in the installed iPad app. It is blocked inside this preview window.</p>' : ''}
     <div class="paper">${reportsHtml(t)}</div>
     <div class="actionsBar">
-      ${done ? deleteButton(t) + '<button data-act="home">Back to tickets</button>' : '<button data-act="backToTicket">Back to picking</button>'}
+      ${done ? deleteButton(t) + '<button data-act="home">Back to tickets</button>' : '<button data-act="backToTicket">Back to the items</button>'}
       <button class="primary" data-act="print">${done ? 'Print again' : 'Print reports & complete'}</button>
     </div>`;
 }
@@ -387,7 +356,7 @@ function reportsView(t) {
 function cleanView(t) {
   const back = returnsOf(t).filter(r => r.bin);
   return `<div class="pageHead"><div><p class="eyebrow">Completed ${esc(fmtDate(t.completedAt))}</p><h1>Order ${esc(t.orderNumber)} · ${esc(t.ticket)}</h1></div></div>
-    <p class="note">Completed by ${esc(t.picker || 'the picker')} with no discrepancies, so there are no reports to print.</p>
+    <p class="note">Completed by ${esc(t.picker || 'the inspector')} with no discrepancies, so there are no reports to print.</p>
     <div class="panel">${orderBlock(t)}${back.length ? `<p class="returned">Returned to inventory: ${back.map(r => `<strong>${esc(r.item)}</strong> in bin <strong>${esc(r.bin)}</strong>`).join(', ')}</p>` : ''}</div>
     <div class="actionsBar">${deleteButton(t)}<button data-act="home">Back to tickets</button></div>`;
 }
@@ -397,7 +366,7 @@ function settingsView() {
     <div class="panel"><h3>Backup</h3><p class="muted">Everything is saved on this iPad only. Save a backup file now and then, for example to Files or OneDrive.</p>
       <div class="row"><button data-act="backup">Save backup file</button><label class="fileBtn">Restore from backup<input id="restoreFile" type="file" accept=".json,application/json" data-act-change="restore"></label></div>
       <p class="muted small">Restore adds pick tickets that aren't already on this iPad. Nothing is overwritten.</p></div>
-    <div class="panel"><h3>Picker names</h3>${db.pickers.length ? `<ul class="names">${db.pickers.map(n => `<li>${esc(n)} <button class="small quiet" data-act="dropPicker" data-name="${esc(n)}">Remove</button></li>`).join('')}</ul>` : '<p class="muted">Names are added the first time a picker chooses "Add my name".</p>'}</div>
+    <div class="panel"><h3>Inspector names</h3>${db.pickers.length ? `<ul class="names">${db.pickers.map(n => `<li>${esc(n)} <button class="small quiet" data-act="dropPicker" data-name="${esc(n)}">Remove</button></li>`).join('')}</ul>` : '<p class="muted">Names are added the first time an inspector chooses "Add my name".</p>'}</div>
     ${flowPanel()}
     <div class="panel"><h3>About</h3><p class="muted">Assemblies & Conversions · pilot version 2 · ${db.tickets.length} pick tickets saved</p></div>`;
 }
@@ -520,8 +489,8 @@ async function pickup(force = false) {
 function settled(d) { if (!d || !d.fileId) return; markSeen(d.fileId); view.pending = view.pending.filter(x => x !== d); }
 
 // ---------- bottom sheet (problem entry, picker name, delete) ----------
-// A problem found while picking can be any of the three types. One found after picking (inspection or conversion)
-// is Damaged or Incomplete package, and comes off the picked quantity.
+// A problem found while checking the items can be any of the three types: Not available is anything shipping didn't
+// bring. One found later, in a conversion, is Damaged or Incomplete package, and comes off the checked quantity.
 const sheetMax = (l, s) => s.picked ? l.picked : remaining(l);
 
 function renderSheet() {
@@ -536,7 +505,7 @@ function renderSheet() {
           <div class="chooser">${s.choose.map(id => t.lines.find(x => x.id === id)).map(x => `<button class="choice ${x.id === s.lineId ? 'on' : ''}" data-act="pLine" data-id="${x.id}" aria-pressed="${x.id === s.lineId}"><span class="item">${esc(x.item)}</span><small>${esc(x.desc)}</small></button>`).join('')}</div>`
         : `<h2 id="sheetTitle">Problem with ${esc(l.item)}</h2><p class="muted">${esc(l.desc)} · bin ${esc(l.bin || '—')}</p>`}
       ${l ? `<div class="choices">${(s.picked ? AFTER_PICK : PROBLEMS).map(p => `<button class="choice ${s.type === p ? 'on' : ''}" data-act="pType" data-type="${p}" aria-pressed="${s.type === p}">${p}</button>`).join('')}</div>
-      <div class="stepper"><span>How many?</span><button class="icon" data-act="pDec" aria-label="Fewer">−</button><output id="pQty">${fmtQty(s.qty)}</output><button class="icon" data-act="pInc" aria-label="More">＋</button><span class="muted">of ${fmtQty(max)} ${s.picked ? 'picked' : 'left'}</span></div>
+      <div class="stepper"><span>How many?</span><button class="icon" data-act="pDec" aria-label="Fewer">−</button><output id="pQty">${fmtQty(s.qty)}</output><button class="icon" data-act="pInc" aria-label="More">＋</button><span class="muted">of ${fmtQty(max)} ${s.picked ? 'checked' : 'left'}</span></div>
       <label class="noteField">Notes<input id="pNote" value="${esc(s.note || '')}" placeholder="Optional. Prints on the reports." maxlength="200" autocomplete="off" enterkeyhint="done"></label>` : ''}
       <div class="actionsBar"><button data-act="closeSheet">Cancel</button><button class="primary" data-act="saveProblem" ${l && s.type ? '' : 'disabled'}>Record problem</button></div></div>`;
   } else if (s.kind === 'name') {
@@ -652,7 +621,7 @@ function answer(yes) {
 
 const actions = {
   home: () => go('home', null),
-  back: () => { const t = current(); if (t && t.status !== 'done' && ['reports', 'inspect', 'convert'].includes(view.screen)) go('ticket'); else go('home', null); },
+  back: () => { const t = current(); if (t && t.status !== 'done' && ['reports', 'convert'].includes(view.screen)) go('ticket'); else go('home', null); },
   settings: () => go('settings', null),
   testFlow: async () => {
     const list = $('#flowUrl').value.trim(), one = $('#fileFlowUrl').value.trim();
@@ -688,10 +657,9 @@ const actions = {
     else { view.draft = null; go('home', null); if (note) toast(note); }
   },
   open: b => go('ticket', b.dataset.id),
-  pickAll: b => { const t = current(), l = lineById(b.dataset.id); l.picked = l.qty - problemQty(l); stamp(t, `${l.item}: picked ${fmtQty(l.picked)}`); save(); render(); },
+  pickAll: b => { const t = current(), l = lineById(b.dataset.id); l.picked = l.qty - problemQty(l); stamp(t, `${l.item}: checked ${fmtQty(l.picked)}`); save(); render(); },
   undo: b => { const t = current(), l = lineById(b.dataset.id); l.picked = 0; l.problems = []; stamp(t, `${l.item}: reset`); save(); render(); },
   problem: b => openProblem(lineById(b.dataset.id), false),
-  problemPicked: b => openProblem(lineById(b.dataset.id), true),
   pLine: b => { const l = lineById(b.dataset.id); Object.assign(view.sheet, { lineId: l.id, qty: Math.min(1, l.picked) }); renderSheet(); },
   pType: b => { view.sheet.type = b.dataset.type; renderSheet(); },
   pDec: () => { const s = view.sheet, max = sheetMax(lineById(s.lineId), s); s.qty = Math.max(Math.min(1, max), s.qty - 1); renderSheet(); },
@@ -706,7 +674,7 @@ const actions = {
     const same = l.problems.find(p => p.type === s.type);
     if (same) { same.qty += qty; if (note) same.note = same.note ? `${same.note}; ${note}` : note; }
     else l.problems.push({ type: s.type, qty, note });
-    stamp(t, `${l.item}: ${fmtQty(qty)} ${s.type.toLowerCase()}${s.picked ? ' (found after picking)' : ''}${note ? '. Note: ' + note : ''}`);
+    stamp(t, `${l.item}: ${fmtQty(qty)} ${s.type.toLowerCase()}${s.picked ? ' (found in the conversion)' : ''}${note ? '. Note: ' + note : ''}`);
     // A problem on part of a line leaves the rest to pick; a full-line problem finishes the line.
     save(); view.sheet = null;
     if (s.then === 'reports') go('reports'); else render();
@@ -717,7 +685,7 @@ const actions = {
     if (!name) return toast('Type your name first.');
     if (!db.pickers.some(n => n.toLowerCase() === name.toLowerCase())) db.pickers.push(name);
     db.pickers.sort((a, b) => a.localeCompare(b));
-    const t = current(); if (t) { t.picker = db.pickers.find(n => n.toLowerCase() === name.toLowerCase()); stamp(t, 'Picker: ' + t.picker); }
+    const t = current(); if (t) { t.picker = db.pickers.find(n => n.toLowerCase() === name.toLowerCase()); stamp(t, 'Inspector: ' + t.picker); }
     save(); view.sheet = null; render();
   },
   dropPicker: b => { db.pickers = db.pickers.filter(n => n !== b.dataset.name); save(); render(); },
@@ -725,13 +693,13 @@ const actions = {
   doDelete: () => { db.tickets = db.tickets.filter(t => t.id !== view.sheet.id); save(); go('home', null); toast('Pick ticket deleted.'); },
   next: () => {
     const t = current();
-    if (!allDone(t)) return toast('Finish every line first.');
+    if (!allDone(t)) return toast('Check every line first.');
     if (!t.picker) return toast('Choose your name first.');
-    if (nextStep(t) === 'inspect') return go('inspect');
+    const step = nextStep(t);
+    if (step !== 'convert') { stamp(t, 'Items checked'); save(); return step === 'reports' ? go('reports') : completeOrder(t); }
     if (!t.conv) { t.conv = { step: 0 }; stamp(t, 'Conversion started'); save(); }
     go('convert');
   },
-  inspectDone: () => { const t = current(); stamp(t, 'Inspection done'); if (hasProblems(t)) { save(); go('reports'); } else completeOrder(t); },
   convDone: () => {
     const t = current(), s = convSteps(t)[t.conv.step];
     if (s.key === 'labels' && labelsLeft(t)) return toast('Make the label sheet first.');
@@ -782,7 +750,7 @@ const changeActions = {
   picker: async el => {
     const t = current();
     if (el.value === '__new') { el.value = t.picker || ''; view.sheet = { kind: 'name' }; renderSheet(); return; }
-    t.picker = el.value; if (t.picker) stamp(t, 'Picker: ' + t.picker); save(); render();
+    t.picker = el.value; if (t.picker) stamp(t, 'Inspector: ' + t.picker); save(); render();
   },
   restore: async el => {
     const file = el.files[0]; if (!file) return;
@@ -883,7 +851,6 @@ document.addEventListener('input', e => {
   const el = e.target;
   if (el.dataset.draft) view.draft[el.dataset.draft] = el.value;
   else if (el.dataset.line) view.draft.lines[+el.dataset.line][el.dataset.key] = el.value;
-  else if (el.dataset.bin) { const l = lineById(el.dataset.bin); l.bin = el.value.trim().toUpperCase(); l.binBlank = true; save(); }
   else if (el.dataset.retbin) {
     const [pi, ri] = el.dataset.retbin.split(':').map(Number), r = current().products[pi].returns[ri];
     r.bin = el.value.trim().toUpperCase(); r.binBlank = true; save();

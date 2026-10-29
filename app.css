@@ -118,7 +118,7 @@ table.edit td:nth-child(1) input, table.edit td:nth-child(4) input { font-family
 .progressText { margin: .4rem 0 1rem; color: var(--muted); font-variant-numeric: tabular-nums; }
 .lines { list-style: none; margin: 0 0 1rem; padding: 0; display: grid; gap: .55rem; }
 .lines.locked .line { opacity: .55; }
-.line { display: grid; grid-template-columns: minmax(96px, 120px) minmax(0, 1fr) 76px auto; align-items: center; gap: .9rem;
+.line { display: grid; grid-template-columns: minmax(0, 1fr) 76px auto; align-items: center; gap: .9rem;
   background: var(--surface); border: 1px solid var(--line); border-radius: 14px; padding: .7rem .8rem; }
 .line.done { background: var(--ok-bg); border-color: transparent; }
 .line.hasProblem { background: var(--warn-bg); border-color: transparent; }
@@ -226,7 +226,7 @@ input.binBlank:disabled { opacity: 1; }
 
 @media (max-width: 700px) {
   h1 { font-size: 1.4rem; }
-  .line { grid-template-columns: minmax(84px, 104px) minmax(0, 1fr) 60px; }
+  .line { grid-template-columns: minmax(0, 1fr) 60px; }
   .acts { grid-column: 1 / -1; }
   .acts button { flex: 1; }
   .actionsBar .primary, .actionsBar .answer { min-width: 0; flex: 1; }
