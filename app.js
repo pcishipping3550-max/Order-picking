@@ -221,6 +221,9 @@ function orderBlock(t) {
   </div>`;
 }
 
+// Completed tickets can be deleted too, e.g. one read wrong that has to be imported again.
+const deleteButton = t => `<button data-act="askDelete" data-id="${t.id}" class="quiet">Delete ticket</button>`;
+
 function ticketView(t) {
   if (t.status === 'done') return reportsView(t);
   const lines = sortedLines(t), done = pickedCount(t), all = allDone(t), probs = ticketProblems(t).length, left = t.lines.length - done;
@@ -236,7 +239,7 @@ function ticketView(t) {
     ${t.lines.some(l => blankBin(l) && !l.bin) ? '<p class="note">The order shows no bin for some lines. Look the bin up on the computer and fill it in.</p>' : ''}
     <ol class="lines ${needPicker ? 'locked' : ''}">${lines.map(l => lineRow(l, needPicker)).join('')}</ol>
     <div class="actionsBar">
-      <button data-act="askDelete" data-id="${t.id}" class="quiet">Delete ticket</button>
+      ${deleteButton(t)}
       <button class="primary" data-act="next" ${all && !needPicker ? '' : 'disabled'}>${next}</button>
     </div>`;
 }
@@ -375,7 +378,7 @@ function reportsView(t) {
     ${embedded ? '<p class="note">Printing works in the installed iPad app. It is blocked inside this preview window.</p>' : ''}
     <div class="paper">${reportsHtml(t)}</div>
     <div class="actionsBar">
-      ${done ? '<button data-act="home">Back to tickets</button>' : '<button data-act="backToTicket">Back to picking</button>'}
+      ${done ? deleteButton(t) + '<button data-act="home">Back to tickets</button>' : '<button data-act="backToTicket">Back to picking</button>'}
       <button class="primary" data-act="print">${done ? 'Print again' : 'Print reports & complete'}</button>
     </div>`;
 }
@@ -386,7 +389,7 @@ function cleanView(t) {
   return `<div class="pageHead"><div><p class="eyebrow">Completed ${esc(fmtDate(t.completedAt))}</p><h1>Order ${esc(t.orderNumber)} · ${esc(t.ticket)}</h1></div></div>
     <p class="note">Completed by ${esc(t.picker || 'the picker')} with no discrepancies, so there are no reports to print.</p>
     <div class="panel">${orderBlock(t)}${back.length ? `<p class="returned">Returned to inventory: ${back.map(r => `<strong>${esc(r.item)}</strong> in bin <strong>${esc(r.bin)}</strong>`).join(', ')}</p>` : ''}</div>
-    <div class="actionsBar"><button data-act="home">Back to tickets</button></div>`;
+    <div class="actionsBar">${deleteButton(t)}<button data-act="home">Back to tickets</button></div>`;
 }
 
 function settingsView() {
@@ -483,7 +486,7 @@ async function pickup(force = false) {
   const list = stored(FLOW), one = stored(FILEFLOW);
   if (embedded || pickingUp || !isAddress(list) || !isAddress(one) || !navigator.onLine || (!force && Date.now() - lastPickup < 30000)) return;
   pickingUp = true; lastPickup = Date.now();
-  let added = 0; const unread = [], check = [];
+  let added = 0, plain = 0; const unread = [], check = [];
   try {
     const r = await callFlow(list);
     const waiting = new Set(view.pending.map(d => d.fileId));
@@ -494,7 +497,8 @@ async function pickup(force = false) {
       if (g.problem) break; // the rest come next time
       if (g.unreadable) { unread.push(fileName(f)); markSeen(f.Id); continue; }
       const d = g.draft;
-      if (d.ticket.trim() && db.tickets.some(t => t.ticket === d.ticket.trim())) markSeen(f.Id);
+      if (d.plain) { plain++; markSeen(f.Id); }
+      else if (d.ticket.trim() && db.tickets.some(t => t.ticket === d.ticket.trim())) markSeen(f.Id);
       else if (draftProblem(d) || d.lines.some(l => !String(l.item).trim())) check.push(d);
       else { const t = newTicketFrom(d); stamp(t, 'Picked up from the Pick Tickets folder'); db.tickets.push(t); save(); markSeen(f.Id); added++; }
     }
@@ -505,6 +509,7 @@ async function pickup(force = false) {
   const msg = [
     added && `${n(added, 'new pick ticket', 'new pick tickets')} added to In progress.`,
     check.length && `${n(check.length, 'new pick ticket needs', 'new pick tickets need')} checking.`,
+    plain && `${n(plain, 'plain pick ticket', 'plain pick tickets')} left out. ${PLAIN}`,
     unread.length && `Could not read ${unread.join(', ')} from the folder. Use Enter by hand for ${unread.length === 1 ? 'it' : 'those'}.`
   ].filter(Boolean).join(' ');
   if (!msg) return;
@@ -547,7 +552,7 @@ function renderSheet() {
   } else if (s.kind === 'delete') {
     const t = ticketById(s.id);
     el.innerHTML = `<div class="sheetBody" role="dialog" aria-modal="true" aria-labelledby="sheetTitle"><h2 id="sheetTitle">Delete pick ticket ${esc(t.ticket)}?</h2>
-      <p class="muted">Its picking progress is removed from this iPad. This can't be undone.</p>
+      <p class="muted">${t.status === 'done' ? 'The completed order is removed from this iPad.' : 'Its picking progress is removed from this iPad.'} This can't be undone.</p>
       <div class="actionsBar"><button data-act="closeSheet">Keep it</button><button class="danger" data-act="doDelete">Delete</button></div></div>`;
   }
 }
@@ -816,11 +821,17 @@ function serviceTicket(d) {
   d.ticket = copy ? copy.ticket : rounds.length ? `${base}-${rounds.length + 1}` : base;
 }
 
+// Prophet 21 emails a conversion's plain pick ticket together with its BOM, and the app only needs the BOM (john
+// 2026-10-29), so plain pick tickets are left out. Service orders and production pick tickets still come in.
+const PLAIN = 'The app only needs the BOM.';
+
 async function importPdf(file) {
   if (!file) return;
   toast('Reading ' + file.name + '…');
   try {
-    view.draft = await readPdf(file);
+    const d = await readPdf(file);
+    if (d.plain) return toast(`That's a plain pick ticket, so it was left out. ${PLAIN}`, 8000);
+    view.draft = d;
     $('#toast').hidden = true;
     go('review', null);
   } catch (e) { console.error(e); toast('This PDF could not be read. Use Enter by hand instead.'); }
@@ -834,22 +845,24 @@ async function importPdfs(files) {
   if (files.length < 2) return importPdf(files[0]);
   if (importing) return toast('Still reading the last PDFs.');
   importing = true;
-  let added = 0, already = 0; const unread = [], check = [];
+  let added = 0, already = 0, plain = 0; const unread = [], check = [];
   try {
     for (const [i, file] of files.entries()) {
       toast(`Reading ${i + 1} of ${files.length}…`, 60000);
       let d;
       try { d = await readPdf(file); } catch (e) { console.error(e); unread.push(file.name); continue; }
-      if (d.ticket.trim() && db.tickets.some(t => t.ticket === d.ticket.trim())) already++;
+      if (d.plain) plain++;
+      else if (d.ticket.trim() && db.tickets.some(t => t.ticket === d.ticket.trim())) already++;
       else if (draftProblem(d) || d.lines.some(l => !String(l.item).trim())) check.push(d);
       else { const t = newTicketFrom(d); stamp(t, 'Imported from PDF'); db.tickets.push(t); added++; }
     }
   } finally { importing = false; }
   save();
   const n = (k, one, many) => `${k} ${k === 1 ? one : many}`;
-  const msg = !added && !check.length && !unread.length ? `All ${already} pick tickets are already in the app.` : [
+  const msg = !added && !check.length && !unread.length && !plain ? `All ${already} pick tickets are already in the app.` : [
     added && `${n(added, 'pick ticket', 'pick tickets')} added to In progress.`,
     already && `${n(already, 'was', 'were')} already in the app.`,
+    plain && `${n(plain, 'plain pick ticket', 'plain pick tickets')} left out. ${PLAIN}`,
     check.length && `${n(check.length, 'needs', 'need')} checking.`,
     unread.length && `Could not read ${unread.join(', ')}. Use Enter by hand for ${unread.length === 1 ? 'it' : 'those'}.`
   ].filter(Boolean).join(' ');

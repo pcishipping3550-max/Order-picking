@@ -206,6 +206,7 @@
     let t;
     if (first.some(i => /PRODUCTION PICK TICKET/i.test(i.text))) t = parseProduction(pages);
     else t = parseStandard(pages, first.some(i => /BILL OF MATERIAL/i.test(i.text)));
+    t.plain = first.some(i => /^PICK TICKET$/i.test(clean(i.text))); // the plain pick ticket Prophet 21 sends along with a BOM
     t.lines = t.lines.filter(l => l.qty > 0);
     for (const l of t.lines) {
       l.bin = pickBins(l);
