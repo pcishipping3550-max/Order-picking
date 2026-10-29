@@ -198,6 +198,9 @@ function reviewView() {
     <div class="actionsBar">${view.queue ? '<button data-act="nextDraft">Skip this PDF</button>' : '<button data-act="home">Cancel</button>'}<button class="primary" data-act="saveDraft">Save pick ticket</button></div>`;
 }
 
+// Under the order number at the top of a ticket's screens: one order can have several pick tickets.
+const ticketLine = t => `<p class="pageSub">Pick ticket <strong>${esc(t.ticket)}</strong></p>`;
+
 function pickerSelect(t) {
   return `<label class="pickerSel">Picker<select id="pickerSelect" data-act-change="picker">
       <option value="">Choose your name</option>
@@ -224,7 +227,7 @@ function ticketView(t) {
   const needPicker = !t.picker;
   const next = !all ? `${left} line${left === 1 ? '' : 's'} left`
     : nextStep(t) === 'inspect' ? 'Inspect' : t.conv ? `Continue conversion · step ${t.conv.step + 1}` : 'Start conversion';
-  return `<div class="pageHead"><div><p class="eyebrow">${esc(t.type)}${t.customer ? ' · ' + esc(t.customer) : ''}</p><h1>Order ${esc(t.orderNumber)}</h1></div>${pickerSelect(t)}</div>
+  return `<div class="pageHead"><div><p class="eyebrow">${esc(t.type)}${t.customer ? ' · ' + esc(t.customer) : ''}</p><h1>Order ${esc(t.orderNumber)}</h1>${ticketLine(t)}</div>${pickerSelect(t)}</div>
     <details class="panel orderDetails"><summary>Order details</summary>${orderBlock(t)}${t.service ? `<p class="muted">Service item: ${esc(t.service)}</p>` : ''}</details>
     ${t.products.length ? `<div class="panel builds">${t.products.map(p => `<p><span class="chip">${p.kind === 'conversion' ? 'Conversion' : 'Assembly'}</span> <strong>${esc(p.item)}</strong> × ${fmtQty(p.qty)}</p>${p.returns.length ? `<p class="muted">Removed and returned to stock: ${p.returns.map(r => esc(r.item) + ' × ' + fmtQty(r.qty)).join(', ')}</p>` : ''}`).join('')}</div>` : ''}
     ${needPicker ? '<p class="note strong">Choose your name above before picking.</p>' : ''}
@@ -261,7 +264,7 @@ function lineRow(l, locked) {
 // ---------- inspect ----------
 function inspectView(t) {
   const probs = hasProblems(t);
-  return `<div class="pageHead"><div><p class="eyebrow">Inspect · ${esc(t.type)}${t.customer ? ' · ' + esc(t.customer) : ''}</p><h1>Order ${esc(t.orderNumber)}</h1></div></div>
+  return `<div class="pageHead"><div><p class="eyebrow">Inspect · ${esc(t.type)}${t.customer ? ' · ' + esc(t.customer) : ''}</p><h1>Order ${esc(t.orderNumber)}</h1>${ticketLine(t)}</div></div>
     <p class="note">Quick visual check of what you picked: the quantities are correct and nothing is damaged. Tap Problem on anything that isn't right.</p>
     <ol class="lines">${sortedLines(t).map(inspectRow).join('')}</ol>
     <div class="actionsBar"><button class="quiet" data-act="backToTicket">‹ Back to picking</button>
@@ -279,7 +282,7 @@ function inspectRow(l) {
 // ---------- conversion ----------
 function convertView(t) {
   const steps = convSteps(t), i = Math.min(t.conv.step, steps.length - 1), s = steps[i], model = convNames(t).model;
-  return `<div class="pageHead"><div><p class="eyebrow">Conversion${model ? ' · ' + esc(model) : ''}</p><h1>Order ${esc(t.orderNumber)}</h1></div></div>
+  return `<div class="pageHead"><div><p class="eyebrow">Conversion${model ? ' · ' + esc(model) : ''}</p><h1>Order ${esc(t.orderNumber)}</h1>${ticketLine(t)}</div></div>
     <div class="progress" role="progressbar" aria-valuemin="0" aria-valuemax="${steps.length}" aria-valuenow="${i}"><div style="width:${i / steps.length * 100}%"></div></div>
     <p class="stepCount">Step ${i + 1} of ${steps.length}</p>
     <section class="panel stepCard">
@@ -580,6 +583,50 @@ async function labelTemplateBytes() {
   const r = await fetch('label-template.pdf'); if (!r.ok) throw Error(); return r.arrayBuffer();
 }
 
+// The label sheet for one converted pump. The two big labels get barcodes of the model and serial.
+async function labelSheet(c) {
+  const pdf = await PDFLib.PDFDocument.load(await labelTemplateBytes()), form = pdf.getForm();
+  for (const n of ['1', '2', '3']) { form.getTextField('MODEL ' + n).setText(c.model); form.getTextField('SERIAL ' + n).setText(c.serial); }
+  for (const k of ['POWER', 'LPH', 'BAR', 'GPH', 'PSI']) form.getTextField(k).setText(String(c[k.toLowerCase()]));
+  form.getTextField('ITEM').setText(c.removed);
+  for (const name of ['MODEL 2', 'SERIAL 2', 'MODEL 3', 'SERIAL 3']) barcodeBeside(pdf.getPage(0), form, name, 470);
+  form.flatten();
+  return pdf.save();
+}
+
+// Code 39, the kind of barcode on the factory pump labels: each character is 5 bars and 4 spaces, 3 of them wide.
+const CODE39 = {
+  0: '000110100', 1: '100100001', 2: '001100001', 3: '101100000', 4: '000110001', 5: '100110000', 6: '001110000', 7: '000100101',
+  8: '100100100', 9: '001100100', A: '100001001', B: '001001001', C: '101001000', D: '000011001', E: '100011000', F: '001011000',
+  G: '000001101', H: '100001100', I: '001001100', J: '000011100', K: '100000011', L: '001000011', M: '101000010', N: '000010011',
+  O: '100010010', P: '001010010', Q: '000000111', R: '100000110', S: '001000110', T: '000010110', U: '110000001', V: '011000001',
+  W: '111000000', X: '010010001', Y: '110010000', Z: '011010000', '-': '010000101', '.': '110000100', ' ': '011000100',
+  '*': '010010100' // $ / + and % are left out: many scanners read them as the start of a different character
+};
+
+// Draws a field's barcode to its right, ending at the label's right edge. When the value is too long to leave room
+// for bars a scanner can read, its text gets smaller; a value Code 39 can't hold, like one with a comma, gets none.
+function barcodeBeside(page, form, name, right) {
+  const field = form.getTextField(name), value = (field.getText() || '').trim(), code = '*' + value.toUpperCase() + '*';
+  if (!value || [...code].some(ch => !CODE39[ch])) return;
+  const widths = [...code].map(ch => [...CODE39[ch]].map(w => w === '1' ? 3 : 1)); // in narrow bars
+  const modules = widths.reduce((n, w) => n + w.reduce((a, b) => a + b) + 1, -1) + 20; // with 10 blank on each side
+  const box = field.acroField.getWidgets()[0].getRectangle(), font = form.getDefaultFont();
+  let size = +(/([\d.]+) Tf/.exec(field.acroField.getDefaultAppearance() || '') || [0, 28])[1], m;
+  for (;; size--) {
+    m = Math.min(1, (right - box.x - 8 - font.widthOfTextAtSize(value, size)) / modules);
+    if (m >= 0.6 || size <= 14) break;
+  }
+  if (m < 0.45) return;
+  field.setFontSize(size);
+  const h = Math.min(30, box.height - 8), y = box.y + (box.height - h) / 2;
+  let x = right - (modules - 10) * m;
+  for (const w of widths) {
+    w.forEach((n, i) => { if (i % 2 === 0) page.drawRectangle({ x, y, width: n * m, height: h, color: PDFLib.rgb(0, 0, 0) }); x += n * m; });
+    x += m;
+  }
+}
+
 function completeOrder(t) {
   t.status = 'done'; t.completedAt = now(); stamp(t, 'Saved with no discrepancies'); save();
   go('home', null); toast(`Order ${t.orderNumber} saved. On to the next one.`);
@@ -709,13 +756,7 @@ const actions = {
     const missing = ['model', 'serial', 'power', 'gph', 'psi', 'lph', 'bar', 'removed'].filter(k => !String(c[k] || '').trim());
     if (missing.length) return toast('Fill in: ' + missing.map(k => k === 'removed' ? 'removed liquid end' : k.toUpperCase()).join(', ') + '.');
     try {
-      const bytes = await labelTemplateBytes();
-      const pdf = await PDFLib.PDFDocument.load(bytes), form = pdf.getForm();
-      for (const n of ['1', '2', '3']) { form.getTextField('MODEL ' + n).setText(c.model); form.getTextField('SERIAL ' + n).setText(c.serial); }
-      for (const k of ['POWER', 'LPH', 'BAR', 'GPH', 'PSI']) form.getTextField(k).setText(String(c[k.toLowerCase()]));
-      form.getTextField('ITEM').setText(c.removed);
-      form.flatten();
-      const blob = new Blob([await pdf.save()], { type: 'application/pdf' });
+      const blob = new Blob([await labelSheet(c)], { type: 'application/pdf' });
       c.madeAt = now(); stamp(t, `Label sheet made: ${c.model} serial ${c.serial}`); save(); render();
       if (embedded) return toast('Label sheet made. Opening it works in the installed iPad app.');
       await deliverFile(blob, `${t.orderNumber} - ${c.model} - ${c.serial} - labels.pdf`.replace(/[\\/:*?"<>|]/g, '_'), 'Label sheet ready', 'Print the label sheet at actual size on label paper.');
@@ -761,7 +802,18 @@ async function readPdf(file) {
   }
   await doc.destroy();
   const d = P.parsePages(pages);
+  serviceTicket(d);
   return { fromPdf: true, ...d, lines: d.lines.map(l => ({ ...l })) };
+}
+
+// Service orders have no pick ticket number, so the service order number stands in for it. The same service order
+// printed again with different parts is another round (11075831-2); an exact copy keeps its number and is left out.
+function serviceTicket(d) {
+  const base = d.orderNumber.trim();
+  if (d.type !== 'Service' || d.ticket.trim() || !base) return;
+  const rounds = db.tickets.filter(t => t.ticket === base || t.ticket.startsWith(base + '-'));
+  const copy = rounds.find(t => t.lines.length === d.lines.length && t.lines.every((l, i) => l.item === String(d.lines[i].item).trim() && l.qty === +d.lines[i].qty));
+  d.ticket = copy ? copy.ticket : rounds.length ? `${base}-${rounds.length + 1}` : base;
 }
 
 async function importPdf(file) {

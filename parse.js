@@ -7,10 +7,12 @@
   const toQty = s => Number(clean(s).replace(/,/g, ''));
   const isItem = s => /^[A-Z0-9][A-Z0-9 ._\/#-]*$/i.test(clean(s)) && /\d/.test(s) && clean(s).length <= 40;
 
-  // Group text pieces into visual rows, left to right.
+  // Group text pieces into visual rows, left to right. Emailed tickets draw some text twice in the same spot, a hidden
+  // white copy first and the visible text over it, so only the last piece drawn at a spot is kept.
   function rows(items) {
-    const out = [];
-    for (const it of items.filter(i => clean(i.text) && !/^[▌█\s]+$/.test(i.text)).sort((a, b) => a.y - b.y || a.x - b.x)) {
+    const out = [], drawn = items.filter(i => clean(i.text) && !/^[▌█\s]+$/.test(i.text));
+    const shown = drawn.filter((it, n) => !drawn.some((o, m) => m > n && Math.abs(o.x - it.x) < 1.5 && Math.abs(o.y - it.y) < 1.5));
+    for (const it of shown.sort((a, b) => a.y - b.y || a.x - b.x)) {
       let r = out.find(r => Math.abs(r.y - it.y) < 2.5);
       if (!r) { r = { y: it.y, items: [] }; out.push(r); }
       r.items.push(it);
@@ -31,7 +33,11 @@
 
   function taker(items) {
     const label = items.find(i => /^Taker:?$/i.test(clean(i.text)));
-    if (!label) return '';
+    if (!label) {
+      // Service orders print it on one line at the top right: "Order Taker: name".
+      const inline = items.find(i => /^Order Taker:/i.test(clean(i.text)));
+      return inline ? clean(inline.text).replace(/^Order Taker:\s*/i, '') : '';
+    }
     return rows(items.filter(i => i.y > label.y + 2 && i.y < label.y + 30 && i.x > label.x - 70 && i.x < label.x + 110))
       .map(r => r.text).find(t => t && !/^\d/.test(t)) || '';
   }
@@ -58,12 +64,20 @@
     return next ? clean(next.text) : '';
   }
 
-  function addBin(target, bin) {
+  // qty is how many the ticket says to take from that bin, when it says.
+  function addBin(target, bin, qty) {
     bin = clean(bin);
     if (!target || !bin) return;
     const bins = target.bin ? target.bin.split(' / ') : [];
     if (!bins.includes(bin)) bins.push(bin);
     target.bin = bins.join(' / ');
+    if (qty != null) target.binQty = { ...target.binQty, [bin]: qty };
+  }
+  // "BIN: FF0404   Qty: 1.00 EA": the number after "Qty:".
+  function binQty(r) {
+    const label = r.items.find(i => /^Qty:?$/i.test(clean(i.text)));
+    const q = label && r.items.find(i => i.x > label.x && isQty(i.text));
+    return q ? toQty(q.text) : null;
   }
 
   function addDesc(target, text) {
@@ -84,7 +98,15 @@
     };
   }
 
-  // Sales, service and BOM layouts share one column layout.
+  // Where a page's part number and quantity columns are, found from their headings: the sales ticket Prophet 21
+  // emails has them further right than the printed BOM. Quantity is To Pick, or Allocated on a service order.
+  function columns(page) {
+    const head = re => page.find(i => re.test(clean(i.text)));
+    const item = head(/^(?:Item ID|Parts ID and Description)$/i), qty = head(/^To Pick$/i) || head(/^Allocated$/i);
+    return item && qty ? { item: [item.x - 10, item.x + 25], qty: [qty.x - 12, qty.x + 35] } : null;
+  }
+
+  // Sales, service and BOM tickets share one layout of rows; their columns move.
   function parseStandard(pages, isBom) {
     const first = pages[0];
     const t = {
@@ -92,10 +114,11 @@
       ...header(first), customerId: customerId(first), service: '', lines: [], products: [], ...addresses(first)
     };
     t.customer = t.billTo.split('\n')[0] || t.shipTo.split('\n')[0] || '';
-    let serviceMode = false, cur = null, product = null, comp = null;
+    let serviceMode = false, cur = null, product = null, comp = null, col = { item: [215, 255], qty: [110, 175] };
     for (const page of pages) {
       const head = page.find(i => /^Item Description$/i.test(clean(i.text)));
       const top = head ? head.y + 14 : 230;
+      col = columns(page) || col;
       for (const r of rows(page)) {
         if (r.y < top || r.y > 718 || SKIP.test(r.text)) continue;
         if (/\*+\s*Service Item\s*\*+/i.test(r.text)) { serviceMode = true; cur = null; continue; }
@@ -119,8 +142,8 @@
           }
         }
 
-        const item = r.items.find(i => i.x >= 215 && i.x < 255 && isItem(i.text));
-        const qty = r.items.find(i => i.x >= 110 && i.x < 175 && isQty(i.text));
+        const item = r.items.find(i => i.x >= col.item[0] && i.x < col.item[1] && isItem(i.text));
+        const qty = r.items.find(i => i.x >= col.qty[0] && i.x < col.qty[1] && isQty(i.text));
         if (item && qty) {
           if (serviceMode) { t.service += clean(item.text) + '\n'; cur = null; continue; }
           if (isBom) {
@@ -134,11 +157,13 @@
         }
         if (serviceMode) { if (/Serial Number:|Ordered As:/i.test(r.text)) t.service += r.text + '\n'; continue; }
         if (!cur) continue;
+        const serial = /^Serial Number:\s*(\S.*)$/i.exec(r.text); // the serial numbers Prophet 21 set aside for this line
+        if (serial) { cur.serials = [...(cur.serials || []), clean(serial[1])]; continue; }
         const binLabel = r.items.find(i => /^BIN:/i.test(clean(i.text)));
         if (binLabel) {
-          const inline = clean(binLabel.text).replace(/^BIN:\s*/i, '');
+          const inline = clean(binLabel.text).replace(/\bBIN:\s*/gi, ''); // service orders list every bin: "BIN:A1; BIN:DOCK"
           const next = r.items.find(i => i.x > binLabel.x + 5 && i.x < 380 && !/Qty:/i.test(i.text));
-          if (cur !== product) addBin(cur, inline || (next && next.text));
+          if (cur !== product) addBin(cur, inline || (next && next.text), binQty(r));
           continue;
         }
         addDesc(cur, r.items.filter(i => i.x >= 215 && i.x < 440).map(i => i.text).join(' '));
@@ -148,7 +173,7 @@
     for (const p of t.products) {
       p.kind = /\bCONV\b/i.test(p.item + ' ' + p.desc) ? 'conversion' : 'assembly';
       p.returns = p.components.filter(c => c.qty < 0).map(c => ({ item: c.item, desc: c.desc, bin: c.bin, qty: -c.qty }));
-      for (const c of p.components.filter(c => c.qty > 0)) t.lines.push({ item: c.item, desc: c.desc, bin: c.bin, qty: c.qty, product: p.item });
+      for (const c of p.components.filter(c => c.qty > 0)) t.lines.push({ item: c.item, desc: c.desc, bin: c.bin, binQty: c.binQty, qty: c.qty, product: p.item });
       delete p.components;
     }
     return t;
@@ -167,7 +192,7 @@
         if (item && qty) { cur = { item: clean(item.text), desc: '', bin: '', qty: toQty(qty.text) }; t.lines.push(cur); continue; }
         if (!cur) continue;
         const binLabel = r.items.find(i => /^BIN:?$/i.test(clean(i.text)));
-        if (binLabel) { const b = r.items.find(i => i.x > binLabel.x + 5 && i.x < 430); addBin(cur, b && b.text); continue; }
+        if (binLabel) { const b = r.items.find(i => i.x > binLabel.x + 5 && i.x < 430); addBin(cur, b && b.text, binQty(r)); continue; }
         addDesc(cur, r.items.filter(i => i.x >= 262 && i.x < 540).map(i => i.text).join(' '));
       }
     }
@@ -182,7 +207,27 @@
     if (first.some(i => /PRODUCTION PICK TICKET/i.test(i.text))) t = parseProduction(pages);
     else t = parseStandard(pages, first.some(i => /BILL OF MATERIAL/i.test(i.text)));
     t.lines = t.lines.filter(l => l.qty > 0);
+    for (const l of t.lines) {
+      l.bin = pickBins(l);
+      if (l.serials) l.desc = [l.desc, (l.serials.length > 1 ? 'Serial numbers ' : 'Serial number ') + l.serials.join(', ')].filter(Boolean).join(' · ');
+      delete l.binQty; delete l.serials;
+    }
     return t;
+  }
+
+  // The bins a line shows. When the ticket gives a quantity per bin, the bins it says to take them from: a sales
+  // ticket can list a part's empty bins too, at 0.00. Otherwise the current bins.
+  function pickBins(line) {
+    const from = Object.keys(line.binQty || {}).filter(b => line.binQty[b] > 0);
+    return from.length ? from.join(' / ') : currentBins(line.bin);
+  }
+
+  // Bins are being renamed, and the current ones are two characters then four numbers (CC0201-T, FF0503, 0H0201).
+  // When a part lists one of those, the old bins are left off.
+  function currentBins(bin) {
+    const all = String(bin || '').split(/;|\s\/\s/).map(clean).filter(Boolean);
+    const current = all.filter(b => /^[A-Z0-9][A-Z]\d{4}/i.test(b));
+    return current.length ? current.join(bin.includes(';') ? '; ' : ' / ') : clean(bin);
   }
 
   // Conversion label values from a BOM product, e.g. "C131-415SI CONV" + "8 gph 60 psi ...".
