@@ -98,8 +98,8 @@
     };
   }
 
-  // Where a page's part number and quantity columns are, found from their headings: the sales ticket Prophet 21
-  // emails has them further right than the printed BOM. Quantity is To Pick, or Allocated on a service order.
+  // Where a page's part number and quantity columns are, found from their headings: the tickets and BOMs Prophet 21
+  // emails have them further right than the printed ones. Quantity is To Pick, or Allocated on a service order.
   function columns(page) {
     const head = re => page.find(i => re.test(clean(i.text)));
     const item = head(/^(?:Item ID|Parts ID and Description)$/i), qty = head(/^To Pick$/i) || head(/^Allocated$/i);
@@ -127,7 +127,7 @@
         if (isBom) {
           const level = r.items.find(i => /^Level:$/i.test(clean(i.text)));
           if (level) {
-            const num = r.items.find(i => i.x > 200 && i.x < 260);
+            const num = r.items.find(i => i.x >= col.item[0] && i.x < col.item[1]); // the part number, in the Item ID column
             if (num && product) {
               comp = { item: clean(num.text), desc: '', bin: '', qty: 0, level: Number(clean((r.items.find(i => i.x > level.x + 20 && i.x < 200) || {}).text)) || 0 };
               product.components.push(comp);
@@ -173,7 +173,7 @@
     for (const p of t.products) {
       p.kind = /\bCONV\b/i.test(p.item + ' ' + p.desc) ? 'conversion' : 'assembly';
       p.returns = p.components.filter(c => c.qty < 0).map(c => ({ item: c.item, desc: c.desc, bin: c.bin, qty: -c.qty }));
-      for (const c of p.components.filter(c => c.qty > 0)) t.lines.push({ item: c.item, desc: c.desc, bin: c.bin, binQty: c.binQty, qty: c.qty, product: p.item });
+      for (const c of p.components.filter(c => c.qty > 0)) t.lines.push({ item: c.item, desc: c.desc, bin: c.bin, binQty: c.binQty, serials: c.serials, qty: c.qty, product: p.item });
       delete p.components;
     }
     return t;
