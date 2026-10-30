@@ -78,7 +78,7 @@ function cameFor(t, p) {
 
 function newTicketFrom(draft) {
   return {
-    id: uid(), created: now(), status: 'open', picker: '', completedAt: null, conv: null,
+    id: uid(), created: now(), status: 'open', picker: '', completedAt: null, conv: null, fromPlain: !!draft.plain,
     type: draft.type, orderNumber: draft.orderNumber.trim(), ticket: draft.ticket.trim(), taker: draft.taker.trim(),
     customer: draft.customer.trim(), customerId: (draft.customerId || '').trim(), billTo: draft.billTo.trim(), shipTo: draft.shipTo.trim(), service: (draft.service || '').trim(),
     products: (draft.products || []).map(p => ({ ...p, returns: (p.returns || []).map(r => ({ ...r, bin: (r.bin || '').trim(), binBlank: !(r.bin || '').trim() })) })),
@@ -91,6 +91,13 @@ function newTicketFrom(draft) {
 // BOM the Taker cancels the first ticket in P21 and makes a new one (john 2026-10-29). The order is marked as responded
 // to, with what the new ticket added or took off. Returns the ticket the new one ended up as.
 function addTicket(t) {
+  const plain = plainFor(t);
+  if (plain) { // the BOM keeps the plain one's place on the list, and its id, in case it's open on screen
+    Object.assign(t, { id: plain.id, created: plain.created });
+    db.tickets[db.tickets.indexOf(plain)] = t;
+    stamp(t, `The BOM for pick ticket ${t.ticket} replaced the plain pick ticket`);
+    return t;
+  }
   const w = db.tickets.find(x => x.waiting && x.orderNumber === t.orderNumber && x.ticket !== t.ticket);
   if (!w) { db.tickets.push(t); return t; }
   const count = lines => lines.reduce((m, l) => m.set(l.item.toUpperCase(), (m.get(l.item.toUpperCase()) || 0) + l.qty), new Map());
@@ -114,7 +121,7 @@ function draftProblem(d) {
 function convNames(t) {
   const p = t.products.find(x => x.kind === 'conversion') || { item: '', desc: '', returns: [] };
   const mine = t.lines.filter(l => l.product === p.item), pool = mine.length ? mine : t.lines;
-  const le = pool.find(l => /^LE-/i.test(l.item)) || pool.find(l => /liquid end/i.test(l.desc));
+  const le = pool.find(l => /^LE-/i.test(l.item)) || pool.find(l => /liquid end/i.test(l.desc) && !/pump/i.test(l.desc));
   const pump = pool.find(l => l !== le && /pump/i.test(l.desc)) || pool.find(l => l !== le);
   const model = P.labelDefaults(p).model;
   return { pump, le, model, newLE: le ? le.item : '', oldLE: (p.returns || []).map(r => r.item).join(', '), driver: model.includes('-') ? model.split('-')[0] : '' };
@@ -508,7 +515,13 @@ async function pickup(force = false) {
   const list = stored(FLOW), one = stored(FILEFLOW);
   if (embedded || pickingUp || !isAddress(list) || !isAddress(one) || !navigator.onLine || (!force && Date.now() - lastPickup < 30000)) return;
   pickingUp = true; lastPickup = Date.now();
-  let added = 0, plain = 0; const unread = [], check = [];
+  let added = 0, plain = 0; const unread = [], check = [], plains = [], replaced = [], ids = [];
+  const take = d => {
+    if (leftOut(d)) { plain++; markSeen(d.fileId); }
+    else if (dupOf(d)) markSeen(d.fileId);
+    else if (draftProblem(d) || d.lines.some(l => !String(l.item).trim())) check.push(d);
+    else { const swap = plainFor(d), t = newTicketFrom(d); stamp(t, 'Picked up from the Pick Tickets folder'); addTicket(t); save(); markSeen(d.fileId); swap ? replaced.push(t.orderNumber) : added++; ids.push(t.id); }
+  };
   try {
     const r = await callFlow(list);
     const waiting = new Set(view.pending.map(d => d.fileId));
@@ -518,24 +531,22 @@ async function pickup(force = false) {
       const g = await pdfFromFolder(one, f);
       if (g.problem) break; // the rest come next time
       if (g.unreadable) { unread.push(fileName(f)); markSeen(f.Id); continue; }
-      const d = g.draft;
-      if (d.plain) { plain++; markSeen(f.Id); }
-      else if (d.ticket.trim() && db.tickets.some(t => t.ticket === d.ticket.trim())) markSeen(f.Id);
-      else if (draftProblem(d) || d.lines.some(l => !String(l.item).trim())) check.push(d);
-      else { const t = newTicketFrom(d); stamp(t, 'Picked up from the Pick Tickets folder'); addTicket(t); save(); markSeen(f.Id); added++; }
+      if (g.draft.plain) plains.push(g.draft); else take(g.draft);
     }
+    plains.forEach(take);
   } catch (e) { console.error(e); }
   finally { pickingUp = false; }
   view.pending.push(...check);
   const n = (k, single, plural) => `${k} ${k === 1 ? single : plural}`;
   const msg = [
     added && `${n(added, 'new pick ticket', 'new pick tickets')} added to In progress.`,
+    replacedText(replaced),
     check.length && `${n(check.length, 'new pick ticket needs', 'new pick tickets need')} checking.`,
     plain && `${n(plain, 'plain pick ticket', 'plain pick tickets')} left out. ${PLAIN}`,
     unread.length && `Could not read ${unread.join(', ')} from the folder. Use Enter by hand for ${unread.length === 1 ? 'it' : 'those'}.`
   ].filter(Boolean).join(' ');
   if (!msg) return;
-  if (view.screen === 'home') render();
+  if (view.screen === 'home' || ids.includes(view.id)) render(); // a BOM that replaced the plain ticket on screen keeps its id
   toast(msg, 8000);
 }
 // A ticket from the folder that was checked: saved or skipped, it isn't offered again.
@@ -760,12 +771,12 @@ const actions = {
     const d = view.draft;
     d.lines = d.lines.filter(l => String(l.item).trim());
     const problem = draftProblem(d); if (problem) return toast(problem);
-    const dup = db.tickets.find(t => t.ticket === d.ticket.trim());
+    const dup = dupOf(d);
     if (dup) return toast(`Pick ticket ${d.ticket} is already saved${dup.status === 'done' ? ' and completed' : ''}.`);
-    const t = newTicketFrom(d); stamp(t, d.fromPdf ? 'Imported from PDF' : 'Entered by hand');
+    const swap = plainFor(d), t = newTicketFrom(d); stamp(t, d.fromPdf ? 'Imported from PDF' : 'Entered by hand');
     const kept = addTicket(t); save();
     settled(d);
-    if (view.queue) actions.nextDraft(null, kept === t ? `Pick ticket ${t.ticket} added to In progress.` : `Pick ticket ${t.ticket} joined order ${t.orderNumber}, which was waiting for parts.`);
+    if (view.queue) actions.nextDraft(null, swap ? replacedText([t.orderNumber]) : kept === t ? `Pick ticket ${t.ticket} added to In progress.` : `Pick ticket ${t.ticket} joined order ${t.orderNumber}, which was waiting for parts.`);
     else { view.draft = null; go('ticket', kept.id); }
   },
   // After several PDFs came in at once: the next one that needs checking, or home when none are left.
@@ -929,14 +940,24 @@ function serviceTicket(d) {
 
 // Prophet 21 emails a conversion's plain pick ticket together with its BOM, and the app only needs the BOM (john
 // 2026-10-29), so plain pick tickets are left out. Service orders and production pick tickets still come in.
+// Some conversions print only the plain pick ticket (john 2026-10-30): one with a CONV line comes in, unless the app
+// has its BOM (same pick ticket) or a BOM order of the same number waiting for parts, whose corrected BOM will come.
+// A BOM that comes in later takes the plain one's place while nobody has started it. PDFs that arrive together
+// bring in their BOMs before their plain pick tickets.
 const PLAIN = 'The app only needs the BOM.';
+const leftOut = d => d.plain && (!d.products.length || db.tickets.some(t => t.type === 'BOM' && (t.ticket === d.ticket.trim() || (t.waiting && t.orderNumber === d.orderNumber.trim()))));
+const notStarted = t => t.status === 'open' && !t.picker && !t.conv && !t.waiting && t.lines.every(l => !l.picked && !l.problems.length);
+const plainFor = d => d.type === 'BOM' && db.tickets.find(t => t.fromPlain && t.ticket === d.ticket.trim() && notStarted(t));
+// The ticket the app already has with this pick ticket number, other than a plain one this BOM replaces.
+const dupOf = d => !plainFor(d) && db.tickets.find(t => t.ticket === d.ticket.trim());
+const replacedText = orders => orders.length > 1 ? `The BOMs for orders ${orders.join(', ')} replaced their plain pick tickets.` : orders.length ? `The BOM for order ${orders[0]} replaced its plain pick ticket.` : '';
 
 async function importPdf(file) {
   if (!file) return;
   toast('Reading ' + file.name + '…');
   try {
     const d = await readPdf(file);
-    if (d.plain) return toast(`That's a plain pick ticket, so it was left out. ${PLAIN}`, 8000);
+    if (leftOut(d)) return toast(`That's a plain pick ticket, so it was left out. ${PLAIN}`, 8000);
     view.draft = d;
     $('#toast').hidden = true;
     go('review', null);
@@ -951,22 +972,27 @@ async function importPdfs(files) {
   if (files.length < 2) return importPdf(files[0]);
   if (importing) return toast('Still reading the last PDFs.');
   importing = true;
-  let added = 0, already = 0, plain = 0; const unread = [], check = [];
+  let added = 0, already = 0, plain = 0; const unread = [], check = [], plains = [], replaced = [];
+  const take = d => {
+    if (leftOut(d)) plain++;
+    else if (dupOf(d)) already++;
+    else if (draftProblem(d) || d.lines.some(l => !String(l.item).trim())) check.push(d);
+    else { const swap = plainFor(d), t = newTicketFrom(d); stamp(t, 'Imported from PDF'); addTicket(t); swap ? replaced.push(t.orderNumber) : added++; }
+  };
   try {
     for (const [i, file] of files.entries()) {
       toast(`Reading ${i + 1} of ${files.length}…`, 60000);
       let d;
       try { d = await readPdf(file); } catch (e) { console.error(e); unread.push(file.name); continue; }
-      if (d.plain) plain++;
-      else if (d.ticket.trim() && db.tickets.some(t => t.ticket === d.ticket.trim())) already++;
-      else if (draftProblem(d) || d.lines.some(l => !String(l.item).trim())) check.push(d);
-      else { const t = newTicketFrom(d); stamp(t, 'Imported from PDF'); addTicket(t); added++; }
+      if (d.plain) plains.push(d); else take(d);
     }
+    plains.forEach(take);
   } finally { importing = false; }
   save();
   const n = (k, one, many) => `${k} ${k === 1 ? one : many}`;
-  const msg = !added && !check.length && !unread.length && !plain ? `All ${already} pick tickets are already in the app.` : [
+  const msg = !added && !replaced.length && !check.length && !unread.length && !plain ? `All ${already} pick tickets are already in the app.` : [
     added && `${n(added, 'pick ticket', 'pick tickets')} added to In progress.`,
+    replacedText(replaced),
     already && `${n(already, 'was', 'were')} already in the app.`,
     plain && `${n(plain, 'plain pick ticket', 'plain pick tickets')} left out. ${PLAIN}`,
     check.length && `${n(check.length, 'needs', 'need')} checking.`,

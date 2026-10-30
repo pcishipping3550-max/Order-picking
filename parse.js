@@ -213,7 +213,21 @@
       if (l.serials) l.desc = [l.desc, (l.serials.length > 1 ? 'Serial numbers ' : 'Serial number ') + l.serials.join(', ')].filter(Boolean).join(' · ');
       delete l.binQty; delete l.serials;
     }
+    if (t.plain) plainConversions(t);
     return t;
+  }
+
+  // Some conversions print only the plain pick ticket, with no BOM (john 2026-10-30, pick ticket 21049720). Its CONV
+  // line is the conversion, as a BOM's would be, and the pump with the same number (B141312SI for B141-312SI CONV) is
+  // marked as its part.
+  function plainConversions(t) {
+    const bare = s => String(s).replace(/[^A-Z0-9]/gi, '').toUpperCase();
+    for (const l of t.lines.filter(l => /\bCONV\b/i.test(l.item))) {
+      const p = { item: l.item, desc: l.desc, qty: l.qty, kind: 'conversion', returns: [] }, model = bare(labelDefaults(p).model);
+      for (const x of t.lines) if (x !== l && bare(x.item) === model) x.product = p.item;
+      t.products.push(p);
+    }
+    t.lines = t.lines.filter(l => !/\bCONV\b/i.test(l.item));
   }
 
   // The bins a line shows. When the ticket gives a quantity per bin, the bins it says to take them from: a sales
