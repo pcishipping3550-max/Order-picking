@@ -170,12 +170,13 @@
       }
     }
     t.service = t.service.trim();
-    for (const p of t.products) {
+    // pi: the product a line goes into, since one BOM can make several products with the same name (11231963)
+    t.products.forEach((p, pi) => {
       p.kind = /\bCONV\b/i.test(p.item + ' ' + p.desc) ? 'conversion' : 'assembly';
       p.returns = p.components.filter(c => c.qty < 0).map(c => ({ item: c.item, desc: c.desc, bin: c.bin, qty: -c.qty }));
-      for (const c of p.components.filter(c => c.qty > 0)) t.lines.push({ item: c.item, desc: c.desc, bin: c.bin, binQty: c.binQty, serials: c.serials, qty: c.qty, product: p.item });
+      for (const c of p.components.filter(c => c.qty > 0)) t.lines.push({ item: c.item, desc: c.desc, bin: c.bin, binQty: c.binQty, serials: c.serials, qty: c.qty, product: p.item, pi });
       delete p.components;
-    }
+    });
     return t;
   }
 
@@ -211,7 +212,8 @@
     for (const l of t.lines) {
       l.bin = pickBins(l);
       if (l.serials) l.desc = [l.desc, (l.serials.length > 1 ? 'Serial numbers ' : 'Serial number ') + l.serials.join(', ')].filter(Boolean).join(' · ');
-      delete l.binQty; delete l.serials;
+      else delete l.serials;
+      delete l.binQty;
     }
     if (t.plain) plainConversions(t);
     return t;
@@ -224,7 +226,7 @@
     const bare = s => String(s).replace(/[^A-Z0-9]/gi, '').toUpperCase();
     for (const l of t.lines.filter(l => /\bCONV\b/i.test(l.item))) {
       const p = { item: l.item, desc: l.desc, qty: l.qty, kind: 'conversion', returns: [] }, model = bare(labelDefaults(p).model);
-      for (const x of t.lines) if (x !== l && bare(x.item) === model) x.product = p.item;
+      for (const x of t.lines) if (x !== l && bare(x.item) === model) { x.product = p.item; x.pi = t.products.length; }
       t.products.push(p);
     }
     t.lines = t.lines.filter(l => !/\bCONV\b/i.test(l.item));

@@ -36,6 +36,7 @@ let toastTimer;
 function load() {
   try { const raw = localStorage.getItem(STORE); if (raw) db = Object.assign({ tickets: [], pickers: [] }, JSON.parse(raw)); }
   catch (e) { toast('Saved tickets could not be read on this device.'); }
+  for (const t of db.tickets) if (t.conv && !t.conv.v) t.conv = null; // started before the stacks (2026-11-25): they start over
 }
 function save() {
   try { localStorage.setItem(STORE, JSON.stringify(db)); return true; }
@@ -55,7 +56,6 @@ const ticketProblems = t => t.lines.flatMap(l => l.problems.map(p => ({ line: l,
 const hasProblems = t => ticketProblems(t).length > 0;
 const allDone = t => t.lines.length > 0 && t.lines.every(lineDone);
 const pickedCount = t => t.lines.filter(lineDone).length;
-const labelsLeft = t => t.labels.filter(c => !c.madeAt).length;
 const fmtQty = n => Number.isInteger(n) ? String(n) : String(+n.toFixed(3));
 const isConversion = t => t.products.some(p => p.kind === 'conversion');
 const returnsOf = t => t.products.flatMap(p => p.returns || []);
@@ -82,8 +82,7 @@ function newTicketFrom(draft) {
     type: draft.type, orderNumber: draft.orderNumber.trim(), ticket: draft.ticket.trim(), taker: draft.taker.trim(),
     customer: draft.customer.trim(), customerId: (draft.customerId || '').trim(), billTo: draft.billTo.trim(), shipTo: draft.shipTo.trim(), service: (draft.service || '').trim(),
     products: (draft.products || []).map(p => ({ ...p, returns: (p.returns || []).map(r => ({ ...r, bin: (r.bin || '').trim(), binBlank: !(r.bin || '').trim() })) })),
-    lines: draft.lines.map(l => ({ id: uid(), item: l.item.trim(), desc: l.desc.trim(), bin: (l.bin || '').trim(), qty: +l.qty, product: l.product || '', picked: 0, problems: [] })),
-    labels: (draft.products || []).filter(p => p.kind === 'conversion').flatMap(p => Array.from({ length: Math.max(1, Math.round(p.qty)) }, (_, i) => ({ id: uid(), product: p.item, unit: i + 1, of: Math.max(1, Math.round(p.qty)), ...P.labelDefaults(p) })))
+    lines: draft.lines.map(l => ({ id: uid(), item: l.item.trim(), desc: l.desc.trim(), bin: (l.bin || '').trim(), qty: +l.qty, product: l.product || '', ...(l.pi != null ? { pi: l.pi } : {}), ...(l.serials ? { serials: l.serials.slice() } : {}), picked: 0, problems: [] }))
   };
 }
 
@@ -117,37 +116,217 @@ function draftProblem(d) {
   return '';
 }
 
-// Part numbers for the conversion steps, e.g. pump C13120PB, new LE-415SI, removed LE-20PB, model C131-415SI on driver C131.
-function convNames(t) {
-  const p = t.products.find(x => x.kind === 'conversion') || { item: '', desc: '', returns: [] };
-  const mine = t.lines.filter(l => l.product === p.item), pool = mine.length ? mine : t.lines;
-  const le = pool.find(l => /^LE-/i.test(l.item)) || pool.find(l => /liquid end/i.test(l.desc) && !/pump/i.test(l.desc));
-  const pump = pool.find(l => l !== le && /pump/i.test(l.desc)) || pool.find(l => l !== le);
-  const model = P.labelDefaults(p).model;
-  return { pump, le, model, newLE: le ? le.item : '', oldLE: (p.returns || []).map(r => r.item).join(', '), driver: model.includes('-') ? model.split('-')[0] : '' };
+// ---------- conversion plan (john 2026-11-25) ----------
+// Before anything is opened, the parts are stacked (one stack per finished pump), each serial number is checked
+// against its box, and the label pages are printed and taped on. Then each stack runs the steps of its type.
+const POWER = { 1: '115V', 2: '230V US', 3: '230V DIN', 5: 'UK 240V', 6: 'Australia 250V', 7: 'Swiss 230V' }; // by the drive's last digit
+const lead = s => (String(s || '').trim().toUpperCase().match(/^[A-Z]{1,3}\d{3}/) || [''])[0]; // the drive of a model: AD851 of AD851-832SI
+const powerOf = model => POWER[lead(model).slice(-1)] || '';
+// LMI part numbers tell the kind of part: LE-832SI a liquid end, AD851 a driver, 57706 a valve or check valve, and
+// anything else a pump (AD851938SI, PD751832SI, C13120PB).
+function kindOf(item) {
+  const s = String(item || '').trim().toUpperCase();
+  return /^LE[-\s]?\w/.test(s) ? 'le' : /^\d{4,6}(-\w+)?$/.test(s) ? 'part' : /^[A-Z]{1,3}\d{3}$/.test(s) ? 'driver' : 'pump';
+}
+const KIND = { le: 'liquid end', part: 'part', driver: 'driver', pump: 'pump' };
+const leOf = pump => { const rest = String(pump || '').trim().toUpperCase().slice(lead(pump).length).replace(/^-/, ''); return rest ? 'LE-' + rest : ''; };
+// john's short form of a serial number: the last 3 digits before the dash and what follows (26105217240-2 is 240-2).
+const shortSerial = s => { const m = /(\d{3})(-\w+)?$/.exec(String(s || '').trim()); return m ? m[1] + (m[2] || '') : String(s || '').trim(); };
+const serialsOf = l => l.serials || ((/Serial numbers? ([^·]+)$/.exec(l.desc || '') || [])[1] || '').split(',').map(x => x.trim()).filter(Boolean);
+const sameSerial = (a, b) => String(a).replace(/\s+/g, '').toUpperCase() === String(b).replace(/\s+/g, '').toUpperCase();
+const valveName = x => /\b4FV\b|four.?function|4.?function/i.test(x.desc || '') ? 'four function valve' : /\bMFV\b|multi.?function/i.test(x.desc || '') ? 'multifunction valve' : 'valve';
+const andList = xs => xs.length < 3 ? xs.join(' and ') : xs.slice(0, -1).join(', ') + ' and ' + xs[xs.length - 1];
+
+// The lines that go into product number pi. Tickets read before 2026-11-25 don't number them: lines are matched by
+// name, and products with the same name take their lines in ticket order, a new product starting when a part repeats
+// or its quantity doesn't match.
+function linesOf(t, pi) {
+  const p = t.products[pi];
+  if (t.lines.some(l => l.pi != null)) return t.lines.filter(l => l.pi === pi);
+  const same = t.products.map((x, i) => i).filter(i => t.products[i].item === p.item), mine = t.lines.filter(l => l.product === p.item);
+  if (same.length < 2) return mine;
+  const groups = same.map(() => []); let k = 0;
+  for (const l of mine) {
+    while (k < same.length - 1 && groups[k].length && (groups[k].some(x => x.item === l.item) || l.qty !== t.products[same[k]].qty)) k++;
+    groups[k].push(l);
+  }
+  return groups[same.indexOf(pi)];
 }
 
-// john's conversion workflow, step by step, in his words. problemIf: the answer that means a discrepancy.
-function convSteps(t) {
-  const n = convNames(t), oldLE = n.oldLE ? 'liquid end ' + n.oldLE : 'the original liquid end';
-  return [
-    { key: 'unpack', text: 'Remove contents and verify the individual parts in the packages.' },
-    { key: 'pumpBox', problemIf: 'no', line: n.pump, text: 'Are all contents in the pump box correct and in good working order?', sub: n.pump ? 'Pump box: ' + n.pump.item : '' },
-    { key: 'lePackage', problemIf: 'no', line: n.le, text: 'Are all contents in the LE package correct and in good working order?', sub: n.le ? 'LE package: ' + n.le.item : '' },
-    { key: 'swap', text: `Remove the ${n.oldLE || 'original'} liquid end from the driver and place it with the items from the pump box.` },
-    { key: 'size', text: 'Verify liquid end is the correct size.' },
-    { key: 'diaphragmOut', text: 'Remove the diaphragm from the driver.', sub: 'See product manual for detailed instructions.' },
-    { key: 'keep', text: 'Place the original diaphragm with the original liquid end and screws.' },
-    { key: 'guide', text: 'Find the diaphragm installation guide in the product manual.' },
-    { key: 'install', text: `Install the new diaphragm and liquid end ${n.newLE ? n.newLE + ' ' : ''}on ${n.driver ? 'driver ' + n.driver : 'the driver'}.` },
-    { key: 'labels', text: 'Print the labels.' },
-    { key: 'labelsOn', text: 'Install the labels.' },
-    { key: 'box', text: 'Place the pump in the box, along with any remaining parts that came with the new liquid end.' },
-    { key: 'leBox', text: `Place ${oldLE} in the liquid end box.` },
-    { key: 'installCheck', problemIf: 'yes', text: 'Were any parts missing or damaged in the install?' },
-    { key: 'ship', text: `Once all items are complete, place ${n.model ? 'pump ' + n.model : 'the pump'} in the appropriate place for shipping.` },
-    { key: 'inventory', text: `Place ${oldLE} in inventory.` }
-  ];
+// One stack per finished pump. A product made twice is two stacks, its serial numbers paired in ticket order.
+function planStacks(t) {
+  const stacks = [];
+  t.products.forEach((p, pi) => {
+    if (p.kind !== 'conversion') return;
+    const units = Math.max(1, Math.round(p.qty)), lines = linesOf(t, pi), model = P.labelDefaults(p).model;
+    for (let u = 0; u < units; u++) {
+      const items = lines.map(l => ({ lineId: l.id, item: l.item, desc: l.desc, qty: l.qty / units, serial: serialsOf(l)[u] || '', box: '', ok: false }));
+      const returns = (p.returns || []).map(r => ({ item: r.item, desc: r.desc || '', qty: r.qty / units }));
+      stacks.push({ pi, model, items, returns, ...classify(items, returns, model) });
+    }
+  });
+  return stacks;
+}
+const newConv = t => ({ v: 2, step: 0, stacks: planStacks(t), edits: {}, printed: {} });
+
+// The type of conversion, from what goes in and what comes off: A pump + liquid end, B driver + liquid end, C driver +
+// pump, D pump + pump, E pump + check valves, F pump + valve (or nothing but labels), X anything else. keeper is the
+// item whose driver the finished pump keeps, donor the pump that gives its liquid end.
+function classify(items, returns, model) {
+  const idx = k => items.map((x, i) => kindOf(x.item) === k ? i : -1).filter(i => i >= 0);
+  const back = k => returns.filter(r => kindOf(r.item) === k).map(r => r.item);
+  const drivers = idx('driver'), pumps = idx('pump'), les = idx('le'), parts = idx('part');
+  const first = [pumps[0], drivers[0], 0].find(i => i != null);
+  const c = { type: 'X', keeper: first, donor: -1, le: les.length ? les[0] : -1, valves: [], cvNew: [], cvOld: [], oldLE: back('le')[0] || '', retDriver: back('driver')[0] || '' };
+  if (drivers.length === 1 && les.length === 1 && !pumps.length) Object.assign(c, { type: 'B', keeper: drivers[0] });
+  else if (drivers.length === 1 && pumps.length === 1 && !les.length) Object.assign(c, { type: 'C', keeper: drivers[0], donor: pumps[0] });
+  else if (pumps.length === 2 && !drivers.length && !les.length) {
+    const named = pumps.filter(i => back('driver').includes(lead(items[i].item))), other = pumps.filter(i => lead(items[i].item) !== lead(model));
+    const donor = named.length === 1 ? named[0] : other.length === 1 ? other[0] : pumps[1];
+    Object.assign(c, { type: 'D', keeper: pumps.find(i => i !== donor), donor });
+  }
+  else if (pumps.length === 1 && les.length === 1 && !drivers.length) Object.assign(c, { type: 'A', keeper: pumps[0] });
+  else if (pumps.length === 1 && !drivers.length && !les.length && parts.length && back('part').length) Object.assign(c, { type: 'E', keeper: pumps[0], cvNew: parts, cvOld: returns.filter(r => kindOf(r.item) === 'part') });
+  else if (pumps.length === 1 && !drivers.length && !les.length && !returns.length) Object.assign(c, { type: 'F', keeper: pumps[0] });
+  if (c.type !== 'E') c.valves = parts;
+  if (c.donor >= 0 && !c.retDriver) c.retDriver = lead(items[c.donor].item);
+  if ((c.type === 'A' || c.type === 'D') && !c.oldLE) c.oldLE = leOf(items[c.keeper].item);
+  return c;
+}
+const typeName = s => ({ A: 'Pump + liquid end', B: 'Driver + liquid end', C: 'Driver + pump', D: 'Pump + pump', E: 'Pump + check valves', F: s.valves.length ? 'Pump + valve' : 'Labels only', X: 'Conversion' })[s.type];
+const stackText = (s, i) => `Stack ${i + 1}: ${s.items.map(x => x.item + (x.box || x.serial ? ' ' + shortSerial(x.box || x.serial) : '')).join(' + ')}`;
+
+// "discharge check valve 48667 and suction check valve 48679", or "check valves 48667 and 48679" when the BOM doesn't say which.
+function cvPhrase(list) {
+  const side = x => /disch/i.test(x.desc || '') ? 'discharge' : /suct/i.test(x.desc || '') ? 'suction' : '';
+  if (list.length && list.every(side)) return andList(list.map(x => `${side(x)} check valve ${x.item}`));
+  return (list.length === 1 ? 'check valve ' : 'check valves ') + andList(list.map(x => x.item));
+}
+function returnPhrase(s) {
+  const of = k => s.returns.filter(r => kindOf(r.item) === k).map(r => r.item);
+  return andList([...of('driver').map(x => 'driver ' + x), ...of('le').map(x => 'liquid end ' + x),
+    ...(of('part').length ? [s.type === 'E' ? cvPhrase(s.returns.filter(r => kindOf(r.item) === 'part')) : (of('part').length === 1 ? 'part ' : 'parts ') + andList(of('part'))] : []),
+    ...of('pump').map(x => 'pump ' + x)]);
+}
+
+// john's steps for one stack, in his words, with the item numbers in every step. problemIf: the answer that means a
+// discrepancy, on the lines named. charts: the torque and stroke charts go with an install of a liquid end.
+function stackSteps(t, i) {
+  const s = t.conv.stacks[i], last = i === t.conv.stacks.length - 1, model = s.model, it = k => s.items[k] || { item: '', desc: '', lineId: '' };
+  const keep = it(s.keeper), donor = it(s.donor), le = it(s.le), out = [];
+  const add = (key, text, art, extra) => out.push({ key, text, art, ...(extra || {}) });
+  const ask = (k, what) => add('check', `Are all contents in the ${what} correct and in good working order? (${it(k).item})`, ART.check(it(k)), { problemIf: 'no', lines: [it(k).lineId] });
+  const removeLE = (l, d) => add('removeLE', `Remove the screws and liquid end ${l} from driver ${d}. Keep the screws and hose kit with the liquid end. The control cable stays with the driver.`, ART.removeLE);
+  const guide = () => add('guide', 'Find the diaphragm installation guide in the product manual.', ART.guide);
+  const labels = () => s.retDriver
+    ? add('labelsOn', `Install the labels from each label page: ${model} on the pump and its box, ${s.retDriver} on the driver and its box.`, ART.labels2)
+    : add('labelsOn', `Install the ${model} labels from the label page on the pump and its box.`, ART.labels1);
+  const bagLE = l => {
+    add('bag', `Place liquid end ${l} in a parts bag.`, ART.bagLE);
+    add('leBox', `Place the bag with liquid end ${l} in an empty liquid end box, with its diaphragm, screws, hose kit and the parts that came with it. Put the ${l} ITEM sticker on the box.`, ART.leBox);
+  };
+  const driverBox = () => add('driverBox', `Place driver ${s.retDriver} and its control cable, if it has one, in the ${donor.item} box.`, ART.boxDriver);
+  const unpack = () => add('unpack', 'Remove contents and verify the individual parts in the packages.', ART.unpack(s.items));
+  const moving = s.donor >= 0 ? leOf(donor.item) : '';
+  unpack();
+  if (s.type === 'A') {
+    const d = lead(keep.item);
+    ask(s.keeper, 'pump box'); ask(s.le, 'LE package');
+    removeLE(s.oldLE, d);
+    add('diaphragmOut', `Remove the diaphragm from driver ${d}.`, ART.removeDia);
+    add('keep', `Place the original diaphragm with liquid end ${s.oldLE} and its screws.`, ART.keepDia);
+    guide();
+    add('install', `Install the new diaphragm and liquid end ${le.item} on driver ${d}.`, ART.install, { charts: true });
+    labels();
+    add('box', `Place pump ${model} in the ${keep.item} box, along with any remaining parts that came with liquid end ${le.item}.`, ART.boxPump);
+    bagLE(s.oldLE);
+  } else if (s.type === 'B') {
+    ask(s.keeper, 'driver box'); ask(s.le, 'LE package');
+    guide();
+    add('install', `Install the diaphragm and liquid end ${le.item} on driver ${keep.item}.`, ART.install, { charts: true });
+    labels();
+    add('box', `Place pump ${model} in the ${keep.item} box, along with any remaining parts that came with liquid end ${le.item}.`, ART.boxPump);
+  } else if (s.type === 'C') {
+    ask(s.keeper, 'driver box'); ask(s.donor, 'pump box');
+    removeLE(moving, s.retDriver);
+    add('diaphragmOut', `Remove the diaphragm from driver ${s.retDriver} and keep it with liquid end ${moving}.`, ART.removeDia);
+    guide();
+    add('install', `Install liquid end ${moving} and its diaphragm on driver ${keep.item}.`, ART.install, { charts: true });
+    labels();
+    add('box', `Place pump ${model} in the ${keep.item} box, with the hose kit and any remaining parts that came with liquid end ${moving}.`, ART.boxPump);
+    driverBox();
+  } else if (s.type === 'D') {
+    const d = lead(keep.item);
+    ask(s.keeper, 'pump box'); ask(s.donor, 'pump box');
+    removeLE(s.oldLE, d);
+    add('diaphragmOut', `Remove the diaphragm from driver ${d} and keep it with liquid end ${s.oldLE}.`, ART.removeDia);
+    removeLE(moving, s.retDriver);
+    add('diaphragmOut2', `Remove the diaphragm from driver ${s.retDriver} and keep it with liquid end ${moving}.`, ART.removeDia);
+    guide();
+    add('install', `Install liquid end ${moving} and its diaphragm on driver ${d}.`, ART.install, { charts: true });
+    labels();
+    add('box', `Place pump ${model} in the ${keep.item} box, with the hose kit and any remaining parts that came with liquid end ${moving}.`, ART.boxPump);
+    driverBox();
+    bagLE(s.oldLE);
+  } else if (s.type === 'E') {
+    const fresh = s.cvNew.map(it);
+    ask(s.keeper, 'pump box');
+    add('check', `Are the new check valves correct and in good working order? (${fresh.map(x => x.item).join(', ')})`, ART.cvCheck, { problemIf: 'no', lines: fresh.map(x => x.lineId) });
+    add('cvOut', `Remove ${cvPhrase(s.cvOld)} from the pump head. Keep the pieces in the order they were removed.`, ART.removeCV);
+    add('cvIn', `Install ${cvPhrase(fresh)} in the pump head.`, ART.installCV);
+    add('arrows', 'Make sure all the arrows are pointing in the correct direction when assembling. The arrow on the pump head indicates which way the arrows on the individual pieces will point.', ART.arrows);
+    labels();
+    add('box', `Place pump ${model} back in its box, with the rest of its parts.`, ART.boxBack);
+    add('bag', s.cvOld.length === 1 ? `Place check valve ${s.cvOld[0].item} in a parts bag with its ITEM sticker.` : `Place check valves ${andList(s.cvOld.map(x => x.item))} in separate parts bags, each with its ITEM sticker.`, ART.bagCV);
+  } else if (s.type === 'F') {
+    ask(s.keeper, 'pump box');
+    for (const v of s.valves.map(it)) add('check', `Is ${valveName(v)} ${v.item} correct and in good working order?`, ART.check(v), { problemIf: 'no', lines: [v.lineId] });
+    labels();
+    add('box', `Place pump ${model} back in its box, with the rest of its parts.`, ART.boxBack);
+  } else {
+    s.items.forEach((x, k) => kindOf(x.item) === 'part' ? add('check', `Is part ${x.item} correct and in good working order?`, ART.check(x), { problemIf: 'no', lines: [x.lineId] })
+      : ask(k, kindOf(x.item) === 'le' ? 'LE package' : KIND[kindOf(x.item)] + ' box'));
+    add('build', `Convert the parts into pump ${model} as the BOM shows.`, ART.install, { charts: s.items.some(x => kindOf(x.item) === 'le') });
+    labels();
+    add('box', `Place pump ${model} in its box, with the rest of its parts.`, ART.boxBack);
+  }
+  // A valve on the BOM with nothing taken off for it goes in the box, whatever the type (john: "sounds good").
+  for (const v of s.valves.map(it)) add('valveBox', `Place ${valveName(v)} ${v.item} in the box with pump ${model}.`, ART.valveBox);
+  add('installCheck', s.type === 'F' ? 'Were any parts missing or damaged?' : 'Were any parts missing or damaged in the install?', ART.missing, { problemIf: 'yes', lines: s.items.map(x => x.lineId) });
+  add('ship', `Place pump ${model} in the appropriate place for shipping.${last ? ' Put the pick ticket/BOM paperwork with the order.' : ''}`, ART.ship(last));
+  if (s.returns.length) add('receiving', `Place ${returnPhrase(s)} in the designated place for receiving to return to inventory.`, ART.receive(s.returns));
+  return out;
+}
+
+// The whole conversion as one list: each stack with its serial numbers, the label pages, taping them on, then each
+// stack's steps. t.conv.step is the place in it.
+function convFlow(t) {
+  const n = t.conv.stacks.length;
+  return [...t.conv.stacks.map((s, i) => ({ phase: 'stack', s: i })), { phase: 'labels' }, { phase: 'tape' },
+    ...t.conv.stacks.flatMap((s, i) => stackSteps(t, i).map((st, k, all) => ({ phase: 'work', s: i, k, n: all.length, of: n, ...st })))];
+}
+const convAt = t => { const f = convFlow(t); return f[Math.min(t.conv.step, f.length - 1)]; };
+const convLabel = t => { const s = convAt(t); return s.phase === 'work' ? `Stack ${s.s + 1} of ${s.of} · step ${s.k + 1} of ${s.n}` : 'Before you start'; };
+// A serial number typed in because the box shows a different one prints on the label page, and both go on the Taker
+// report under MISMATCHED SERIAL NUMBERS, which doesn't hold the order up (john 2026-11-25).
+const mismatches = t => t.conv && t.conv.v ? t.conv.stacks.flatMap(s => s.items.filter(x => x.box && x.serial && !sameSerial(x.box, x.serial)).map(x => ({ item: x.item, serial: x.serial, box: x.box }))) : [];
+
+// The label pages: one for each finished pump (its ITEM sticker is a part that came off, blank when none), one for
+// each driver that goes back, with the serial of the pump it came from, and one more ITEM sticker page for each other
+// part that came off. Changes made with Change are kept by the page's key.
+const LABEL_KEYS = ['model', 'serial', 'power', 'gph', 'psi', 'lph', 'bar', 'item'];
+const itemText = r => r ? r.item + (r.qty > 1 ? ' QTY ' + fmtQty(r.qty) : '') : '';
+function labelPages(t) {
+  const pages = [], edits = t.conv.edits || {};
+  t.conv.stacks.forEach((s, i) => {
+    const d = P.labelDefaults(t.products[s.pi] || { item: s.model }), keep = s.items[s.keeper], donor = s.items[s.donor];
+    const serialOf = x => x ? x.box || x.serial : '', on = x => x ? `${KIND[kindOf(x.item)]} ${x.item}${serialOf(x) ? ' ' + shortSerial(serialOf(x)) : ''}` : 'the pump';
+    const stickers = s.returns.filter(r => kindOf(r.item) !== 'driver' && kindOf(r.item) !== 'pump');
+    pages.push({ key: `${i}:pump`, stack: i, model: s.model, serial: serialOf(keep), power: powerOf(s.model), gph: d.gph, psi: d.psi, lph: d.lph, bar: d.bar, item: itemText(stickers[0]), to: on(keep) });
+    stickers.slice(1).forEach((r, k) => pages.push({ key: `${i}:item${k + 1}`, stack: i, model: '', serial: '', power: '', gph: '', psi: '', lph: '', bar: '', item: itemText(r), to: on(keep) }));
+    s.returns.filter(r => kindOf(r.item) === 'driver').forEach((r, k) => pages.push({ key: `${i}:driver${k}`, stack: i, model: r.item, serial: serialOf(donor), power: powerOf(r.item), gph: '', psi: '', lph: '', bar: '', item: '', to: on(donor || keep) }));
+  });
+  return pages.map(pg => ({ ...pg, ...(edits[pg.key] || {}) }));
 }
 
 // ---------- rendering ----------
@@ -167,7 +346,7 @@ function stateLabel(t) {
   if (t.waiting) return t.response ? 'Taker responded' : 'Waiting for parts';
   if (!allDone(t)) return `${pickedCount(t)} of ${t.lines.length} lines`;
   if (nextStep(t) !== 'convert') return nextStep(t) === 'reports' ? 'Ready to print reports' : 'Ready to save';
-  return t.conv ? `Conversion step ${t.conv.step + 1} of ${convSteps(t).length}` : 'Ready to convert';
+  return t.conv ? convLabel(t) : 'Ready to convert';
 }
 
 function homeView() {
@@ -178,7 +357,7 @@ function homeView() {
     return `<button class="ticketCard${t.waiting ? (t.response ? ' responded' : ' waiting') : ''}" data-act="open" data-id="${t.id}">
       <span class="tcMain"><span class="tcOrder">Order ${esc(t.orderNumber)}</span><span class="tcSub">Pick ticket ${esc(t.ticket)} · ${esc(t.type)}${t.customer ? ' · ' + esc(t.customer) : ''}</span></span>
       <span class="tcState">${t.status === 'done'
-        ? `<span class="chip ${probs ? 'warn' : 'ok'}">${probs ? probs + ' discrepanc' + (probs === 1 ? 'y' : 'ies') : 'Complete'}</span><small>${esc(fmtDate(t.completedAt))}${t.picker ? ' · ' + esc(t.picker) : ''}</small>`
+        ? `<span class="chip ${probs || mismatches(t).length ? 'warn' : 'ok'}">${probs ? probs + ' discrepanc' + (probs === 1 ? 'y' : 'ies') : mismatches(t).length ? 'Serial mismatch' : 'Complete'}</span><small>${esc(fmtDate(t.completedAt))}${t.picker ? ' · ' + esc(t.picker) : ''}</small>`
         : `<span class="chip">${esc(stateLabel(t))}</span><small>${t.picker ? esc(t.picker) : 'Not started'}</small>`}</span>
     </button>`;
   };
@@ -258,7 +437,7 @@ function ticketView(t) {
   const done = pickedCount(t), all = allDone(t), probs = ticketProblems(t).length, left = t.lines.length - done;
   const needPicker = !t.picker, step = nextStep(t);
   const next = !all ? `${left} line${left === 1 ? '' : 's'} left`
-    : step === 'reports' ? 'Print reports' : step === 'save' ? 'Save order' : t.conv ? `Continue conversion · step ${t.conv.step + 1}` : step === 'resume' ? 'Continue conversion' : 'Start conversion';
+    : step === 'reports' ? 'Print reports' : step === 'save' ? 'Save order' : t.conv || step === 'resume' ? 'Continue conversion' : 'Start conversion';
   return `<div class="pageHead"><div><p class="eyebrow">${esc(t.type)}${t.customer ? ' · ' + esc(t.customer) : ''}</p><h1>Order ${esc(t.orderNumber)}</h1>${ticketLine(t)}</div>${pickerSelect(t)}</div>
     <details class="panel orderDetails"><summary>Order details</summary>${orderBlock(t)}${t.service ? `<p class="muted">Service item: ${esc(t.service)}</p>` : ''}</details>
     ${t.products.length ? `<div class="panel builds">${t.products.map(p => `<p><span class="chip">${p.kind === 'conversion' ? 'Conversion' : 'Assembly'}</span> <strong>${esc(p.item)}</strong> × ${fmtQty(p.qty)}</p>${p.returns.length ? `<p class="muted">Removed and returned to stock: ${p.returns.map(r => esc(r.item) + ' × ' + fmtQty(r.qty)).join(', ')}</p>` : ''}`).join('')}</div>` : ''}
@@ -292,23 +471,57 @@ function lineRow(l, locked) {
 
 // ---------- conversion ----------
 function convertView(t) {
-  const steps = convSteps(t), i = Math.min(t.conv.step, steps.length - 1), s = steps[i], model = convNames(t).model;
-  return `<div class="pageHead"><div><p class="eyebrow">Conversion${model ? ' · ' + esc(model) : ''}</p><h1>Order ${esc(t.orderNumber)}</h1>${ticketLine(t)}</div></div>
-    <div class="progress" role="progressbar" aria-valuemin="0" aria-valuemax="${steps.length}" aria-valuenow="${i}"><div style="width:${i / steps.length * 100}%"></div></div>
-    <p class="stepCount">Step ${i + 1} of ${steps.length}</p>
-    <section class="panel stepCard">
-      <p class="stepText">${esc(s.text)}</p>
-      ${s.sub ? `<p class="stepSub">${esc(s.sub)}</p>` : ''}
-      ${s.key === 'inventory' ? returnBins(t) : ''}
-    </section>
-    ${s.key === 'install' ? chartsHtml() : ''}
-    ${s.key === 'labels' ? labelCards(t) : ''}
-    <div class="actionsBar">
-      <button class="quiet" data-act="${i ? 'convPrev' : 'backToTicket'}">${i ? '‹ Previous step' : '‹ Back to the items'}</button>
-      ${s.problemIf
-        ? '<button class="answer" data-act="convNo">No</button><button class="answer" data-act="convYes">Yes</button>'
-        : `<button class="primary" data-act="convDone">${s.key === 'inventory' ? 'Save the order and move on' : 'Done'}</button>`}
-    </div>`;
+  const flow = convFlow(t), i = Math.min(t.conv.step, flow.length - 1), s = flow[i], n = t.conv.stacks.length;
+  const head = eyebrow => `<div class="pageHead"><div><p class="eyebrow">${esc(eyebrow)}</p><h1>Order ${esc(t.orderNumber)}</h1>${ticketLine(t)}</div></div>
+    <div class="progress" role="progressbar" aria-valuemin="0" aria-valuemax="${flow.length}" aria-valuenow="${i}"><div style="width:${i / flow.length * 100}%"></div></div>`;
+  const card = (art, text, sub) => `<section class="panel stepCard${art ? ' hasArt' : ''}">${art ? `<div class="stepArt">${artSvg(art)}</div>` : ''}<div><p class="stepText">${esc(text)}</p>${sub || ''}</div></section>`;
+  const back = `<button class="quiet" data-act="${i ? 'convPrev' : 'backToTicket'}">${i ? '‹ Previous step' : '‹ Back to the items'}</button>`;
+  const done = label => `<button class="primary" data-act="convDone">${label}</button>`;
+  if (s.phase === 'stack') {
+    const st = t.conv.stacks[s.s];
+    return `${head(`Before you start · Stack ${s.s + 1} of ${n}`)}<p class="stepCount">${esc(typeName(st))}</p>
+      ${card(ART.stack, `Stack these items together for pump ${st.model}.`, `<p class="stepSub">Find the serial number on each box and tap the matching number below. If the box shows a different number, tap Different number and type the one on the box.</p>`)}
+      <ul class="stackItems">${st.items.map((x, k) => stackItem(t, s.s, st, x, k)).join('')}</ul>
+      <div class="actionsBar">${back}${done(s.s < n - 1 ? 'Next stack' : 'Next: label pages')}</div>`;
+  }
+  if (s.phase === 'labels') {
+    const pages = labelPages(t), printed = t.conv.printed || {};
+    return `${head('Before you start')}
+      ${card(ART.pages, 'Print the label pages.', '<p class="stepSub">Put label paper in the printer. Each page goes with the item that has the same serial number.</p>')}
+      <div class="row"><button class="primary" data-act="printAllLabels">Print all label pages</button><button data-act="handLabel">Make a label by hand</button></div>
+      <section class="panel labels">${pages.map(pg => `<div class="labelCard">
+        <h3>${esc(pg.model || 'ITEM sticker')}${pg.serial ? ` <span class="muted">serial ${esc(shortSerial(pg.serial))}</span>` : ''}${printed[pg.key] ? ' <span class="chip ok">Printed</span>' : ''}</h3>
+        <p class="muted small">Stack ${pg.stack + 1} · for ${esc(pg.to)}</p>
+        <p>${esc([pg.power && 'Power ' + pg.power, pg.gph && pg.gph + ' GPH', pg.psi && pg.psi + ' PSI', pg.item && 'ITEM ' + pg.item].filter(Boolean).join(' · ') || 'Model and serial number only')}</p>
+        <div class="row"><button data-act="printLabel" data-key="${pg.key}">Print</button><button class="quiet" data-act="editLabel" data-key="${pg.key}">Change</button></div>
+      </div>`).join('')}</section>
+      <div class="actionsBar">${back}${done('Done')}</div>`;
+  }
+  if (s.phase === 'tape') {
+    return `${head('Before you start')}
+      ${card(ART.tape, 'Tape each label page to the item with the matching serial number, before opening anything.', `<ul class="tapeList">${labelPages(t).map(pg => `<li>The <strong>${esc(pg.model || 'ITEM ' + pg.item)}</strong> page goes on ${esc(pg.to)} (stack ${pg.stack + 1})</li>`).join('')}</ul>`)}
+      <div class="actionsBar">${back}${done('Done')}</div>`;
+  }
+  const end = i === flow.length - 1, report = mismatches(t).length && !t.mismatchPrinted;
+  return `${head(`Stack ${s.s + 1} of ${s.of} · ${typeName(t.conv.stacks[s.s])}`)}<p class="stepCount">Step ${s.k + 1} of ${s.n}</p>
+    ${card(s.art, s.text, `<p class="stackLine">${esc(stackText(t.conv.stacks[s.s], s.s))}</p>`)}
+    ${s.charts ? chartsHtml() : ''}
+    <div class="actionsBar">${back}${s.problemIf
+      ? '<button class="answer" data-act="convNo">No</button><button class="answer" data-act="convYes">Yes</button>'
+      : done(!end ? 'Done' : report ? 'Done, go to the Taker report' : 'Save the order and move on')}</div>`;
+}
+
+// One item of a stack. A driver or pump shows its serial number in john's short form; tapping it says the box shows
+// that number. Different number opens a box to type the one on the box.
+function stackItem(t, si, st, x, k) {
+  const typing = view.typing === `${si}:${k}` || !!x.box || !x.serial, off = x.box && x.serial && !sameSerial(x.box, x.serial);
+  const where = st.type === 'B' && kindOf(x.item) === 'le' ? ' · put it on the driver box' : '';
+  return `<li><div class="what"><span class="item">${x.qty !== 1 ? fmtQty(x.qty) + ' × ' : ''}${esc(x.item)}</span><span class="desc">${esc(KIND[kindOf(x.item)][0].toUpperCase() + KIND[kindOf(x.item)].slice(1) + where)}</span></div>
+    ${x.serial ? `<button class="serialBtn${x.ok && !x.box ? ' on' : ''}" data-act="serialOk" data-s="${si}" data-k="${k}" aria-pressed="${x.ok && !x.box}">${x.ok && !x.box ? '✓ ' : ''}${esc(shortSerial(x.serial))}</button>
+      ${typing ? '' : `<button class="small quiet" data-act="serialOther" data-s="${si}" data-k="${k}">Different number</button>`}` : ''}
+    ${typing && (x.serial || ['driver', 'pump'].includes(kindOf(x.item))) ? `<label class="serialBox">${x.serial ? 'Serial number on the box' : 'Serial number on the box (not on the ticket)'}<input id="sbox-${si}-${k}" data-serialbox="${si}:${k}" value="${esc(x.box)}" autocapitalize="characters" autocomplete="off" autocorrect="off" spellcheck="false"></label>
+      <p class="warnText small" id="soff-${si}-${k}"${off ? '' : ' hidden'}>Different from the ticket. It prints on the label page and goes on the Taker report.</p>` : ''}
+  </li>`;
 }
 
 function chartsHtml() {
@@ -322,29 +535,75 @@ function chartsHtml() {
   </div>`;
 }
 
-function labelCards(t) {
-  if (!t.labels.length) return '';
-  return `<section class="panel labels"><p class="muted">Enter the original pump's serial number and power, check the ratings, then make the label sheet.</p>
-    ${t.labels.map(c => `<div class="labelCard">
-      <h3>${esc(c.model)}${c.of > 1 ? ` <span class="muted">pump ${c.unit} of ${c.of}</span>` : ''}</h3>
-      <div class="grid six">
-        ${[['model', 'Model'], ['serial', 'Serial number'], ['power', 'Power'], ['gph', 'GPH'], ['psi', 'PSI'], ['lph', 'LPH'], ['bar', 'BAR'], ['removed', 'Removed liquid end (ITEM #)']].map(([k, label]) =>
-          `<label>${label}<input id="lab-${c.id}-${k}" data-label="${c.id}" data-key="${k}" value="${esc(c[k])}" ${['gph', 'psi', 'lph', 'bar', 'power'].includes(k) ? 'inputmode="decimal"' : ''}></label>`).join('')}
-      </div>
-      <button data-act="makeLabels" data-id="${c.id}">Make label sheet</button>${c.madeAt ? ` <span class="muted small">Made ${esc(fmtDate(c.madeAt))}</span>` : ''}
-    </div>`).join('')}</section>`;
-}
-
-// Where the removed liquid end goes back on the shelf. A bin the order didn't print is a blank to fill in.
-function returnBins(t) {
-  return t.products.map((p, pi) => (p.returns || []).map((r, ri) => {
-    const blank = r.binBlank || !r.bin;
-    return `<div class="binField"><span class="lbl">Bin for ${esc(r.item)}${r.qty !== 1 ? ' × ' + fmtQty(r.qty) : ''}</span>${blank
-      ? `<input class="binBlank" id="ret-${pi}-${ri}" data-retbin="${pi}:${ri}" value="${esc(r.bin)}" placeholder="Fill in bin" aria-label="Bin for ${esc(r.item)}" autocapitalize="characters" autocomplete="off" spellcheck="false">
-        <small class="muted">The order doesn't show a bin for ${esc(r.item)}. Look it up on the computer.</small>`
-      : `<div class="bin"><span>${esc(r.bin)}</span></div>`}</div>`;
-  }).join('')).join('');
-}
+// ---------- step drawings ----------
+// Plain line drawings, one per step, from the pictures john okayed (2026-11-25). The parts are drawn once, in a hidden
+// set of shapes, and each step places them.
+const ART_DEFS = `<svg width="0" height="0" style="position:absolute" aria-hidden="true" focusable="false"><defs>
+<marker id="a-arrow" viewBox="0 0 10 10" refX="8" refY="5" markerWidth="6" markerHeight="6" orient="auto"><path d="M0,0 L10,5 L0,10 z" fill="#555"/></marker>
+<g id="a-drv"><g class="a-gray"><rect x="0" y="20" width="100" height="58" rx="8"/><rect x="12" y="6" width="56" height="16" rx="5"/><circle cx="26" cy="14" r="4"/><circle cx="52" cy="14" r="4"/><rect x="6" y="78" width="18" height="6" rx="2"/><rect x="76" y="78" width="18" height="6" rx="2"/><rect x="100" y="34" width="8" height="30" rx="2"/></g></g>
+<g id="a-hd"><g class="a-blue"><rect x="50" y="56" width="12" height="12" rx="2"/><rect x="10" y="30" width="40" height="66" rx="8"/></g><line class="a-arr" x1="30" y1="84" x2="30" y2="44" marker-end="url(#a-arrow)"/></g>
+<g id="a-le"><g class="a-blue"><rect x="18" y="0" width="24" height="16" rx="3"/><rect x="19" y="14" width="22" height="17" rx="2"/><rect x="19" y="95" width="22" height="17" rx="2"/><rect x="18" y="110" width="24" height="16" rx="3"/></g><use href="#a-hd"/></g>
+<g id="a-cv"><g class="a-blue"><rect x="0" y="0" width="24" height="16" rx="3"/><rect x="1" y="14" width="22" height="17" rx="2"/></g><line class="a-arr" x1="12" y1="28" x2="12" y2="6" marker-end="url(#a-arrow)"/></g>
+<g id="a-pump"><use href="#a-drv" y="14"/><use href="#a-le" x="98"/></g>
+<g id="a-pumpx"><use href="#a-drv" y="14"/><use href="#a-hd" x="98"/></g>
+<g id="a-dia"><g class="a-red"><circle cx="28" cy="28" r="26"/><circle cx="28" cy="28" r="7"/></g></g>
+<g id="a-scr"><g class="a-gray"><circle cx="6" cy="6" r="5"/><rect x="10" y="4" width="50" height="4" rx="1"/><circle cx="6" cy="22" r="5"/><rect x="10" y="20" width="50" height="4" rx="1"/><circle cx="6" cy="38" r="5"/><rect x="10" y="36" width="50" height="4" rx="1"/><circle cx="6" cy="54" r="5"/><rect x="10" y="52" width="50" height="4" rx="1"/></g></g>
+<g id="a-hk"><g class="a-teal"><ellipse cx="16" cy="5" rx="12" ry="4"/><polygon points="6,13 26,13 22,25 10,25"/><rect x="8" y="29" width="16" height="8" rx="2"/><rect x="2" y="41" width="28" height="30" rx="4"/><rect x="8" y="41" width="2" height="30"/><rect x="15" y="41" width="2" height="30"/><rect x="22" y="41" width="2" height="30"/></g></g>
+<g id="a-cab"><path class="a-arr" d="M0,10 q5,-10 10,0 t10,0 t10,0 t10,0 t10,0"/><g class="a-gray"><rect x="50" y="3" width="14" height="14" rx="3"/><rect x="64" y="6" width="7" height="2"/><rect x="64" y="12" width="7" height="2"/></g></g>
+<g id="a-pbox"><g class="a-amber"><polygon points="0,16 16,0 96,0 80,16"/><polygon points="80,16 96,0 96,62 80,78"/><rect x="0" y="16" width="80" height="62"/></g></g>
+<g id="a-lebox"><g class="a-coral"><polygon points="0,12 12,0 62,0 50,12"/><polygon points="50,12 62,0 62,44 50,56"/><rect x="0" y="12" width="50" height="44"/></g></g>
+<g id="a-lpage"><g class="a-gray"><rect x="0" y="0" width="56" height="76" rx="3"/></g><g class="a-green"><rect x="5" y="5" width="46" height="20" rx="2"/><rect x="5" y="29" width="46" height="20" rx="2"/><rect x="5" y="53" width="21" height="18" rx="2"/><rect x="30" y="53" width="21" height="18" rx="2"/></g></g>
+<g id="a-man"><g class="a-pink"><rect x="0" y="0" width="50" height="70" rx="3"/><rect x="0" y="0" width="8" height="70" rx="2"/><rect x="15" y="16" width="28" height="3"/><rect x="15" y="25" width="28" height="3"/><rect x="15" y="34" width="20" height="3"/></g></g>
+<g id="a-ship"><g class="a-amber"><rect x="14" y="0" width="64" height="38"/></g><g class="a-gray"><rect x="0" y="38" width="92" height="6" rx="1"/><rect x="4" y="44" width="12" height="9"/><rect x="40" y="44" width="12" height="9"/><rect x="76" y="44" width="12" height="9"/></g></g>
+<g id="a-recv"><g class="a-purple"><rect x="4" y="14" width="40" height="30"/><rect x="48" y="22" width="34" height="22"/><rect x="14" y="0" width="26" height="14"/></g><g class="a-gray"><rect x="0" y="44" width="86" height="6" rx="1"/><rect x="4" y="50" width="12" height="9"/><rect x="37" y="50" width="12" height="9"/><rect x="70" y="50" width="12" height="9"/></g></g>
+<g id="a-tkt"><g class="a-gray"><rect x="0" y="0" width="38" height="50" rx="2"/><rect x="6" y="8" width="26" height="3"/><rect x="6" y="16" width="26" height="3"/><rect x="6" y="24" width="20" height="3"/><rect x="6" y="38" width="26" height="6"/></g></g>
+<g id="a-bag"><g class="a-gray"><rect x="0" y="0" width="56" height="66" rx="5"/><rect x="0" y="9" width="56" height="3"/></g></g>
+<g id="a-item"><g class="a-green"><rect x="0" y="0" width="64" height="34" rx="4"/><text class="a-ts" x="10" y="22">ITEM</text></g></g>
+<g id="a-q"><g class="a-gray"><circle cx="22" cy="22" r="20"/><text class="a-th" x="22" y="27" text-anchor="middle">?</text></g></g>
+<g id="a-mfv"><g class="a-purple"><rect x="65" y="0" width="4" height="14"/><rect x="57" y="12" width="20" height="28" rx="2"/><rect x="55" y="18" width="24" height="2"/><rect x="55" y="25" width="24" height="2"/><rect x="55" y="32" width="24" height="2"/><rect x="53" y="76" width="28" height="32" rx="4"/><rect x="58" y="76" width="2" height="32"/><rect x="64" y="76" width="2" height="32"/><rect x="70" y="76" width="2" height="32"/><rect x="76" y="76" width="2" height="32"/><rect x="102" y="44" width="14" height="28" rx="4"/><rect x="32" y="38" width="70" height="40" rx="12"/><rect x="0" y="30" width="32" height="56" rx="6"/><rect x="0" y="37" width="32" height="2"/><rect x="0" y="45" width="32" height="2"/><rect x="0" y="53" width="32" height="2"/><rect x="0" y="61" width="32" height="2"/><rect x="0" y="69" width="32" height="2"/><rect x="0" y="77" width="32" height="2"/></g><g class="a-gray"><polygon points="116,52 133,52 145,64 145,106 133,106 133,68 129,64 116,64"/></g></g>
+</defs></svg>`;
+const u = (id, x, y, s) => `<use href="#a-${id}" transform="translate(${x},${y})${s ? ` scale(${s})` : ''}"/>`;
+const ar = (x1, y1, x2, y2) => `<line class="a-arr" x1="${x1}" y1="${y1}" x2="${x2}" y2="${y2}" marker-end="url(#a-arrow)"/>`;
+const artSvg = inner => `<svg class="art" viewBox="0 0 226 100" role="img" aria-hidden="true">${inner}</svg>`;
+const isValve = x => /\bMFV\b|\b4FV\b|function/i.test(x.desc || '');
+const ART = {
+  // the packages side by side: a box for a pump or driver, a liquid end's box, a bag or the valve for a part
+  unpack: items => {
+    const shapes = items.map(x => { const k = kindOf(x.item); return k === 'le' ? ['lebox', .9, 62, 56] : k === 'part' ? (isValve(x) ? ['mfv', .42, 145, 108] : ['bag', .62, 56, 66]) : ['pbox', .66, 96, 78]; }).slice(0, 3);
+    if (!shapes.length) shapes.push(['pbox', .66, 96, 78]);
+    const gap = 226 / shapes.length, f = shapes.length > 2 ? .72 : 1;
+    return shapes.map(([id, s, w, h], i) => u(id, Math.round(gap * i + (gap - w * s * f) / 2), Math.round(52 - h * s * f / 2), +(s * f).toFixed(3))).join('');
+  },
+  check: x => ({ pump: u('pump', 30, 12, .58), driver: u('drv', 30, 22, .72), le: u('le', 70, 8, .66), part: isValve(x) ? u('mfv', 40, 24, .5) : u('bag', 70, 18, .9) })[kindOf(x.item)] + u('q', 150, 28, .9),
+  cvCheck: u('cv', 62, 18, .9) + u('cv', 100, 18, .9) + u('q', 150, 30, .8),
+  removeLE: u('drv', 6, 22, .5) + u('cab', 8, 70, .6) + ar(64, 46, 90, 46) + u('le', 94, 10, .55) + u('scr', 134, 20, .45) + u('hk', 170, 18, .6),
+  removeDia: u('drv', 8, 26, .5) + ar(66, 46, 92, 46) + u('dia', 98, 28, .6) + u('le', 140, 10, .55),
+  keepDia: u('dia', 14, 30, .6) + ar(56, 48, 84, 48) + u('le', 92, 10, .55) + u('scr', 134, 20, .45),
+  guide: u('man', 88, 14),
+  install: u('drv', 16, 22, .6) + u('dia', 92, 30, .5) + u('le', 128, 12, .58) + ar(204, 50, 172, 50),
+  labels1: u('lpage', 40, 14, .7) + ar(84, 48, 108, 48) + u('pump', 114, 20, .45),
+  labels2: u('lpage', 8, 18, .55) + ar(42, 38, 60, 38) + u('pump', 64, 18, .36) + u('lpage', 128, 18, .55) + ar(162, 38, 180, 38) + u('drv', 184, 26, .38),
+  boxPump: u('pump', 8, 16, .46) + u('hk', 86, 28, .5) + ar(108, 48, 130, 48) + u('pbox', 136, 20, .65),
+  boxBack: u('pump', 14, 16, .5) + ar(100, 48, 128, 48) + u('pbox', 134, 20, .65),
+  boxDriver: u('drv', 10, 24, .5) + u('cab', 12, 70, .6) + ar(74, 46, 102, 46) + u('pbox', 110, 20, .65),
+  bagLE: u('le', 40, 10, .6) + ar(90, 50, 118, 50) + u('bag', 126, 18, .95),
+  leBox: u('bag', 4, 30, .55) + u('dia', 40, 40, .4) + u('hk', 68, 34, .5) + ar(92, 52, 118, 52) + u('lebox', 126, 20, 1.1) + u('item', 134, 48, .55),
+  valveBox: u('mfv', 14, 26, .45) + ar(90, 48, 124, 48) + u('pbox', 134, 20, .65),
+  removeCV: u('pumpx', 10, 16, .5) + ar(100, 46, 128, 46) + u('cv', 136, 8, .8) + '<text class="a-ts" x="162" y="24">Discharge</text>' + u('cv', 136, 50, .8) + '<text class="a-ts" x="162" y="66">Suction</text>',
+  installCV: u('cv', 14, 8, .8) + u('cv', 14, 50, .8) + ar(48, 46, 76, 46) + u('pump', 86, 16, .44),
+  arrows: u('le', 60, 6, .62) + u('cv', 150, 10, .8) + u('cv', 150, 50, .8),
+  bagCV: u('cv', 8, 26, .7) + u('cv', 30, 26, .7) + ar(54, 48, 74, 48) + u('bag', 80, 14, .8) + u('item', 84, 38, .5) + u('bag', 142, 14, .8) + u('item', 146, 38, .5),
+  missing: u('q', 91, 24),
+  ship: paper => u('ship', 40, 26) + (paper ? u('tkt', 146, 28, .9) : ''),
+  receive: rets => {
+    let x = 6, out = '';
+    for (const r of rets.slice(0, 2)) { const k = kindOf(r.item), [id, s, w] = k === 'driver' || k === 'pump' ? ['pbox', .5, 48] : k === 'le' ? ['lebox', .7, 43] : ['bag', .55, 31]; out += u(id, x, 28, s); x += w + 6; }
+    return out + ar(x + 2, 50, x + 24, 50) + u('recv', x + 30, 22, .9);
+  },
+  stack: u('pbox', 66, 46, .55) + u('pbox', 72, 8, .45) + ar(150, 20, 150, 78) + ar(150, 78, 150, 20),
+  pages: u('lpage', 64, 14, .9) + u('lpage', 92, 18, .9) + u('lpage', 120, 22, .9),
+  tape: u('lpage', 30, 14, .7) + ar(76, 48, 102, 48) + u('pbox', 110, 20, .7)
+};
 
 // ---------- reports (printed only when there are discrepancies) ----------
 function reportHeader(t, title) {
@@ -364,19 +623,24 @@ const reportRows = (problems, cells, needs) => problems.map(p => {
 // print on the Taker report only (john 2026-10-29).
 const adjustProblems = t => ticketProblems(t).filter(p => !(p.needs || []).length);
 function takerReport(t) {
-  return `<section class="report"><p class="rStamp">INCOMPLETE</p>${reportHeader(t, 'Taker report')}
-    <p class="rLead">These items were not delivered on this pick ticket.</p>
+  const probs = hasProblems(t), mism = mismatches(t), big = '<p class="rStamp rMismatch">MISMATCHED SERIAL NUMBERS</p>';
+  return `<section class="report">${probs ? '<p class="rStamp">INCOMPLETE</p>' : big}${reportHeader(t, 'Taker report')}
+    ${probs ? `<p class="rLead">These items were not delivered on this pick ticket.</p>
     <table class="rTable"><thead><tr><th>Item</th><th>Description</th><th class="num">Missing</th><th>Discrepancy</th></tr></thead>
     ${reportRows(ticketProblems(t), p => `<td><strong>${esc(p.line.item)}</strong></td><td>${esc(p.line.desc)}</td><td class="num">${fmtQty(p.qty)}</td><td>${esc(p.type)}</td>`, true)}
-    </table></section>`;
+    </table>` : ''}
+    ${mism.length ? `${probs ? big : ''}<table class="rTable"><thead><tr><th>Item</th><th>Serial number on the ticket</th><th>Serial number on the box</th></tr></thead><tbody>${mism.map(m => `<tr><td><strong>${esc(m.item)}</strong></td><td>${esc(m.serial)}</td><td>${esc(m.box)}</td></tr>`).join('')}</tbody></table>` : ''}
+    </section>`;
 }
 // The Taker report as plain text in a new Gmail message, subject filled in (john 2026-10-29). Gmail can't be handed an
 // attachment this way, and john prefers the report in the body anyway.
 function takerText(t) {
-  const lines = ['TAKER REPORT - INCOMPLETE', '', `Order: ${t.orderNumber}`, `Pick ticket: ${t.ticket}`, `Type: ${t.type}`, `Taker: ${t.taker || '-'}`,
+  const mism = mismatches(t), lines = [hasProblems(t) ? 'TAKER REPORT - INCOMPLETE' : 'TAKER REPORT', '', `Order: ${t.orderNumber}`, `Pick ticket: ${t.ticket}`, `Type: ${t.type}`, `Taker: ${t.taker || '-'}`,
     `Inspector: ${t.picker || '-'}`, `Date: ${fmtDate(t.completedAt || now())}`, `Customer: ${t.customer || '-'}`, `Customer #: ${t.customerId || '-'}`,
-    `Bill To: ${(t.billTo || '-').split('\n').join(', ')}`, `Ship To: ${(t.shipTo || '-').split('\n').join(', ')}`, '', 'These items were not delivered on this pick ticket.'];
+    `Bill To: ${(t.billTo || '-').split('\n').join(', ')}`, `Ship To: ${(t.shipTo || '-').split('\n').join(', ')}`];
+  if (hasProblems(t)) lines.push('', 'These items were not delivered on this pick ticket.');
   for (const p of ticketProblems(t)) lines.push('', `${p.line.item}  ${p.line.desc}`, `Missing: ${fmtQty(p.qty)}  ${p.type}`, ...(p.needs || []).map(n => 'Part needed: ' + needText(n)), ...(p.note ? ['Notes: ' + p.note] : []));
+  if (mism.length) lines.push('', 'MISMATCHED SERIAL NUMBERS', ...mism.map(m => `${m.item}  ticket: ${m.serial}  box: ${m.box}`));
   return lines.join('\n');
 }
 const emailButton = t => `<a class="btn" href="${esc('googlegmail:///co?subject=' + encodeURIComponent(`Order ${t.orderNumber} / Pick ticket ${t.ticket} - Taker report`) + '&body=' + encodeURIComponent(takerText(t)))}">Email Taker report</a>`;
@@ -389,22 +653,25 @@ function adjustmentReport(t, problems = adjustProblems(t)) {
 }
 const reportsHtml = t => takerReport(t) + adjustmentReport(t);
 // Two copies of each: one stays with the order (or the deficient item), the other goes to the Taker (or the adjuster).
-const printHtml = t => takerReport(t).repeat(2) + adjustmentReport(t).repeat(2);
+// A Taker report that only has mismatched serial numbers is one copy, to go with the pick ticket on the order.
+const printHtml = t => takerReport(t).repeat(hasProblems(t) ? 2 : 1) + adjustmentReport(t).repeat(2);
 
 function reportsView(t) {
-  const done = t.status === 'done', wait = !done && canWait(t);
-  if (!hasProblems(t)) return done ? cleanView(t) : ticketView(t);
+  const done = t.status === 'done', wait = !done && canWait(t), probs = hasProblems(t);
+  if (!probs && !mismatches(t).length) return done ? cleanView(t) : ticketView(t);
   return `<div class="pageHead"><div><p class="eyebrow">${done ? 'Completed ' + esc(fmtDate(t.completedAt)) : 'Print reports'}</p><h1>Order ${esc(t.orderNumber)} · ${esc(t.ticket)}</h1></div></div>
-    <div class="note strong printSteps">
-      <p>Printing makes 2 copies of ${adjustProblems(t).length ? 'each report' : 'the Taker report'}${done ? '' : wait ? ' and saves this order as Waiting for parts' : ' and completes this pick ticket'}.</p>
-      <p><strong>Taker report:</strong> Place 1 copy of the Taker report with the order and take the other copy to the Taker.</p>
+    <div class="note strong printSteps">${isConversion(t) ? '<p>Put normal paper in the printer, not label paper.</p>' : ''}
+      ${probs ? `<p>Printing makes 2 copies of ${adjustProblems(t).length ? 'each report' : 'the Taker report'}${done ? '' : wait ? ' and saves this order as Waiting for parts' : ' and completes this pick ticket'}.</p>
+      <p><strong>Taker report:</strong> Place 1 copy of the Taker report with the order and take the other copy to the Taker.</p>`
+      : `<p>Printing makes 1 copy of the Taker report${done ? '' : ' and completes this pick ticket'}. It lists the mismatched serial numbers.</p>
+      <p><strong>Taker report:</strong> Place it with the pick ticket on the order.</p>`}
       ${adjustProblems(t).length ? `<p><strong>Inventory adjustment report:</strong> Attach 1 copy of the inventory report to the deficient item and place that item in the designated area. Give the other copy of the inventory report to the inventory adjuster.${adjustProblems(t).every(p => p.type === 'Not available') ? ' If the item is Not available, discard the extra copy.' : ''}</p>` : ''}
     </div>
     ${embedded ? '<p class="note">Printing works in the installed iPad app. It is blocked inside this preview window.</p>' : ''}
     <div class="paper">${reportsHtml(t)}</div>
     <div class="actionsBar">
       ${done ? deleteButton(t) + '<button data-act="home">Back to tickets</button>' : '<button data-act="backToTicket">Back to the items</button>'}${emailButton(t)}
-      <button class="primary" data-act="print">${done ? 'Print again' : wait ? 'Print Taker report & wait for parts' : 'Print reports & complete'}</button>
+      <button class="primary" data-act="print">${done ? 'Print again' : wait ? 'Print Taker report & wait for parts' : probs ? 'Print reports & complete' : 'Print report & complete'}</button>
     </div>`;
 }
 
@@ -414,10 +681,10 @@ const madeWholeText = t => {
 };
 // A pick ticket finished with no discrepancies: nothing was printed.
 function cleanView(t) {
-  const back = returnsOf(t).filter(r => r.bin);
+  const back = returnsOf(t).filter(r => r.bin), sent = t.conv && t.conv.v ? returnsOf(t) : [];
   return `<div class="pageHead"><div><p class="eyebrow">Completed ${esc(fmtDate(t.completedAt))}</p><h1>Order ${esc(t.orderNumber)} · ${esc(t.ticket)}</h1></div></div>
     <p class="note">Completed by ${esc(t.picker || 'the inspector')}${t.madeWhole ? '.' + madeWholeText(t) : ' with no discrepancies, so there are no reports to print.'}</p>
-    <div class="panel">${orderBlock(t)}${back.length ? `<p class="returned">Returned to inventory: ${back.map(r => `<strong>${esc(r.item)}</strong> in bin <strong>${esc(r.bin)}</strong>`).join(', ')}</p>` : ''}</div>
+    <div class="panel">${orderBlock(t)}${sent.length ? `<p class="returned">Sent to receiving: ${sent.map(r => `<strong>${esc(r.item)}</strong>${r.qty !== 1 ? ' × ' + fmtQty(r.qty) : ''}`).join(', ')}</p>` : back.length ? `<p class="returned">Returned to inventory: ${back.map(r => `<strong>${esc(r.item)}</strong> in bin <strong>${esc(r.bin)}</strong>`).join(', ')}</p>` : ''}</div>
     <div class="actionsBar">${deleteButton(t)}<button data-act="home">Back to tickets</button></div>`;
 }
 
@@ -600,6 +867,12 @@ function renderSheet() {
     el.innerHTML = `<div class="sheetBody" role="dialog" aria-modal="true" aria-labelledby="sheetTitle"><h2 id="sheetTitle">${esc(s.title)}</h2>
       <p class="muted">${esc(s.file.name)}</p>
       <div class="actionsBar"><button data-act="closeSheet">Close</button><button class="primary" data-act="shareFile">Print or save</button></div></div>`;
+  } else if (s.kind === 'label') {
+    const f = (k, label, opts = '') => `<label>${label}<input id="labf-${k}" data-labf="${k}" value="${esc(s.c[k])}" ${opts} autocomplete="off" autocorrect="off" spellcheck="false"></label>`;
+    el.innerHTML = `<div class="sheetBody" role="dialog" aria-modal="true" aria-labelledby="sheetTitle"><h2 id="sheetTitle">${s.key ? 'Change this label page' : 'Make a label by hand'}</h2>
+      <p class="muted">${s.key ? 'The changes print on this page.' : 'It prints on its own page.'}</p>
+      <div class="grid six">${f('model', 'Model', 'autocapitalize="characters"')}${f('serial', 'Serial number', 'autocapitalize="characters"')}${f('power', 'Power')}${f('gph', 'GPH', 'inputmode="decimal"')}${f('psi', 'PSI', 'inputmode="decimal"')}${f('lph', 'LPH', 'inputmode="decimal"')}${f('bar', 'BAR', 'inputmode="decimal"')}${f('item', 'ITEM sticker', 'autocapitalize="characters"')}</div>
+      <div class="actionsBar"><button data-act="closeSheet">Cancel</button><button class="primary" data-act="${s.key ? 'saveLabel' : 'printHandLabel'}">${s.key ? 'Save' : 'Print'}</button></div></div>`;
   } else if (s.kind === 'delete') {
     const t = ticketById(s.id);
     el.innerHTML = `<div class="sheetBody" role="dialog" aria-modal="true" aria-labelledby="sheetTitle"><h2 id="sheetTitle">Delete pick ticket ${esc(t.ticket)}?</h2>
@@ -611,7 +884,7 @@ function renderSheet() {
 // ---------- actions ----------
 const current = () => ticketById(view.id);
 const lineById = id => current().lines.find(x => x.id === id);
-const go = (screen, id = view.id) => { view.screen = screen; view.id = id; view.sheet = view.flow = null; if (screen !== 'review') view.queue = view.note = null; render(); window.scrollTo(0, 0); if (screen === 'home') pickup(); };
+const go = (screen, id = view.id) => { view.screen = screen; view.id = id; view.sheet = view.flow = view.typing = null; if (screen !== 'review') view.queue = view.note = null; render(); window.scrollTo(0, 0); if (screen === 'home') pickup(); };
 const stamp = (t, text) => { (t.log = t.log || []).push({ at: now(), text }); };
 
 function openProblem(l, picked, then = null) {
@@ -641,10 +914,10 @@ async function labelTemplateBytes() {
 
 // The label sheet for one converted pump. The two big labels get barcodes of the model and serial.
 async function labelSheet(c) {
-  const pdf = await PDFLib.PDFDocument.load(await labelTemplateBytes()), form = pdf.getForm();
-  for (const n of ['1', '2', '3']) { form.getTextField('MODEL ' + n).setText(c.model); form.getTextField('SERIAL ' + n).setText(c.serial); }
-  for (const k of ['POWER', 'LPH', 'BAR', 'GPH', 'PSI']) form.getTextField(k).setText(String(c[k.toLowerCase()]));
-  form.getTextField('ITEM').setText(c.removed);
+  const pdf = await PDFLib.PDFDocument.load(await labelTemplateBytes()), form = pdf.getForm(), val = k => String(c[k] == null ? '' : c[k]).trim();
+  for (const n of ['1', '2', '3']) { form.getTextField('MODEL ' + n).setText(val('model')); form.getTextField('SERIAL ' + n).setText(val('serial')); }
+  for (const k of ['POWER', 'LPH', 'BAR', 'GPH', 'PSI']) form.getTextField(k).setText(val(k.toLowerCase()));
+  form.getTextField('ITEM').setText(c.item != null ? val('item') : val('removed'));
   for (const name of ['MODEL 2', 'SERIAL 2', 'MODEL 3', 'SERIAL 3']) barcodeBeside(pdf.getPage(0), form, name, 470);
   form.flatten();
   return pdf.save();
@@ -683,6 +956,20 @@ function barcodeBeside(page, form, name, right) {
   }
 }
 
+async function printPages(t, pages, byHand = false) {
+  if (!pages.length) return toast('There are no label pages to print.');
+  try {
+    const out = await PDFLib.PDFDocument.create();
+    for (const c of pages) { const doc = await PDFLib.PDFDocument.load(await labelSheet(c)); const [pg] = await out.copyPages(doc, [0]); out.addPage(pg); }
+    const blob = new Blob([await out.save()], { type: 'application/pdf' });
+    if (!byHand) { t.conv.printed = t.conv.printed || {}; for (const c of pages) t.conv.printed[c.key] = now(); }
+    stamp(t, (byHand ? 'Label made by hand: ' : pages.length > 1 ? 'Label pages printed: ' : 'Label page printed: ') + pages.map(c => [c.model, c.serial, c.item].filter(Boolean).join(' ')).join(', ')); save(); render();
+    if (embedded) return toast(`Label ${pages.length > 1 ? 'pages' : 'page'} made. Printing works in the installed iPad app.`);
+    const one = pages[0], name = pages.length > 1 ? `${t.orderNumber} - label pages.pdf` : `${t.orderNumber} - ${one.model || one.item || 'label'}${one.serial ? ' - ' + shortSerial(one.serial) : ''} - label.pdf`;
+    await deliverFile(blob, name.replace(/[\\/:*?"<>|]/g, '_'), pages.length > 1 ? 'Label pages ready' : 'Label page ready', 'Print at actual size on label paper.');
+  } catch (e) { console.error(e); toast('The label pages could not be made.'); }
+}
+
 function completeOrder(t) {
   t.status = 'done'; t.completedAt = now(); stamp(t, t.madeWhole ? 'Conversion finished with the parts received' : 'Saved with no discrepancies'); save();
   go('home', null); toast(`Order ${t.orderNumber} saved. On to the next one.`);
@@ -691,17 +978,27 @@ function completeOrder(t) {
 // Yes or No on a conversion question. The answer that means a discrepancy records it, then asks for anything else
 // missing or wrong, so every missing piece is on the reports the first time round (john 2026-10-29).
 function answer(yes) {
-  const t = current(), s = convSteps(t)[t.conv.step];
+  const t = current(), s = convAt(t);
   stamp(t, `${s.text} ${yes ? 'Yes' : 'No'}`);
-  if ((s.problemIf === 'yes') !== yes) { t.conv.step++; save(); return go('convert'); }
+  if ((s.problemIf === 'yes') !== yes) return nextConv(t);
   save();
-  if (s.line && s.line.picked > 0) return openProblem(s.line, true, 'reports');
-  chooseProblem(t);
+  const mine = (s.lines || []).map(id => t.lines.find(l => l.id === id)).filter(l => l && l.picked > 0);
+  if (mine.length === 1) return openProblem(mine[0], true, 'reports');
+  chooseProblem(t, null, mine.map(l => l.id));
+}
+// On to the next step, or the end of the conversion: the returns went to receiving, then the Taker report when a serial
+// number didn't match and it hasn't printed yet, else the order is saved.
+function nextConv(t) {
+  if (t.conv.step < convFlow(t).length - 1) { t.conv.step++; save(); return go('convert'); }
+  const sent = t.conv.stacks.flatMap(s => s.returns.map(r => r.item));
+  if (sent.length) stamp(t, 'Sent to receiving: ' + sent.join(', '));
+  if (mismatches(t).length && !t.mismatchPrinted) { stamp(t, 'Conversion finished'); save(); return go('reports'); }
+  completeOrder(t);
 }
 // A conversion problem on any checked part: the parts to choose from, or the only one. again: the "Anything else?"
 // step to come back to.
-function chooseProblem(t, again = null) {
-  const picked = t.lines.filter(l => l.picked > 0);
+function chooseProblem(t, again = null, only = []) {
+  const all = t.lines.filter(l => l.picked > 0), mine = all.filter(l => only.includes(l.id)), picked = mine.length ? mine : all;
   if (!picked.length) return go('reports');
   view.sheet = { kind: 'problem', lineId: picked.length === 1 ? picked[0].id : null, type: '', qty: picked.length === 1 ? Math.min(1, picked[0].picked) : 0, picked: true, then: 'reports', again, choose: picked.map(l => l.id) };
   renderSheet();
@@ -736,7 +1033,7 @@ function resume(t, swap = []) {
     p.line.problems = p.line.problems.filter(x => x.type !== p.type);
   }
   t.waiting = null;
-  if (!t.conv) t.conv = { step: 0 };
+  if (!t.conv) t.conv = newConv(t);
   stamp(t, 'Parts received, conversion continued'); save();
   go(hasProblems(t) ? 'reports' : 'convert');
   if (out.length) { if (embedded) toast('Printing works in the installed iPad app.'); else setTimeout(() => window.print(), 100); }
@@ -838,29 +1135,56 @@ const actions = {
     const step = nextStep(t);
     if (step === 'resume') return askCame(t);
     if (step !== 'convert') { stamp(t, 'Items checked'); save(); return step === 'reports' ? go('reports') : completeOrder(t); }
-    if (!t.conv) { t.conv = { step: 0 }; stamp(t, 'Conversion started'); save(); }
+    if (!t.conv) { t.conv = newConv(t); stamp(t, 'Conversion started'); save(); }
     go('convert');
   },
   convDone: () => {
-    const t = current(), s = convSteps(t)[t.conv.step];
-    if (s.key === 'labels' && labelsLeft(t)) return toast('Make the label sheet first.');
-    if (s.key === 'inventory') {
-      const open = returnsOf(t).filter(r => !r.bin);
-      if (open.length) return toast(`Fill in the bin for ${open.map(r => r.item).join(', ')}. Look it up on the computer.`);
-      if (returnsOf(t).length) stamp(t, 'Returned to inventory: ' + returnsOf(t).map(r => `${r.item} bin ${r.bin}`).join(', '));
-      return completeOrder(t);
+    const t = current(), s = convAt(t);
+    if (s.phase === 'stack') {
+      const st = t.conv.stacks[s.s], open = st.items.filter(x => x.serial && !x.ok), blank = st.items.filter(x => !x.serial && !x.box && ['driver', 'pump'].includes(kindOf(x.item)));
+      if (open.length) return toast(`Tap the serial number for ${andList(open.map(x => x.item))}, or tap Different number and type the one on the box.`);
+      if (blank.length) return toast(`Type the serial number on the box for ${andList(blank.map(x => x.item))}. It prints on the label page.`);
+      stamp(t, `Stack ${s.s + 1} checked: ${st.items.map(x => x.item + (x.box || x.serial ? ' ' + (x.box || x.serial) + (x.box && x.serial && !sameSerial(x.box, x.serial) ? ' (ticket ' + x.serial + ')' : '') : '')).join(', ')}`);
     }
-    t.conv.step++; save(); go('convert');
+    if (s.phase === 'labels') {
+      const left = labelPages(t).filter(pg => !(t.conv.printed || {})[pg.key]).length, key = t.id + ':' + t.conv.step;
+      if (left && view.warned !== key) { view.warned = key; return toast(`${left === 1 ? '1 label page hasn\'t' : left + ' label pages haven\'t'} been printed. Tap Done again to go on anyway.`); }
+    }
+    nextConv(t);
   },
   convPrev: () => { const t = current(); t.conv.step = Math.max(0, t.conv.step - 1); save(); go('convert'); },
+  serialOk: b => { const t = current(), x = t.conv.stacks[+b.dataset.s].items[+b.dataset.k]; x.ok = true; x.box = ''; view.typing = null; save(); render(); },
+  serialOther: b => {
+    const t = current(), x = t.conv.stacks[+b.dataset.s].items[+b.dataset.k];
+    view.typing = `${b.dataset.s}:${b.dataset.k}`; x.ok = !!x.box; save(); render();
+    const el = $(`#sbox-${b.dataset.s}-${b.dataset.k}`); if (el) el.focus();
+  },
+  printAllLabels: () => printPages(current(), labelPages(current())),
+  printLabel: b => printPages(current(), labelPages(current()).filter(pg => pg.key === b.dataset.key)),
+  editLabel: b => { const pg = labelPages(current()).find(x => x.key === b.dataset.key); view.sheet = { kind: 'label', key: pg.key, c: { ...pg } }; renderSheet(); },
+  handLabel: () => { view.sheet = { kind: 'label', key: null, c: { model: '', serial: '', power: '', gph: '', psi: '', lph: '', bar: '', item: '' } }; renderSheet(); },
+  saveLabel: () => {
+    const t = current(), s = view.sheet;
+    t.conv.edits = t.conv.edits || {}; t.conv.edits[s.key] = Object.fromEntries(LABEL_KEYS.map(k => [k, String(s.c[k] || '').trim()]));
+    if (t.conv.printed) delete t.conv.printed[s.key];
+    stamp(t, `Label page changed: ${LABEL_KEYS.map(k => s.c[k]).filter(Boolean).join(' ')}`); save(); view.sheet = null; render();
+  },
+  printHandLabel: async () => {
+    const c = view.sheet.c;
+    if (!LABEL_KEYS.some(k => String(c[k] || '').trim())) return toast('Fill in the label first.');
+    view.sheet = null; renderSheet();
+    await printPages(current(), [c], true);
+  },
   convYes: () => answer(true),
   convNo: () => answer(false),
   backToTicket: () => go('ticket'),
   print: () => {
     const t = current();
     const first = t.status !== 'done', wait = first && canWait(t);
-    if (wait) { t.waiting = now(); stamp(t, 'Taker report printed, waiting for parts'); save(); }
-    else if (first) { t.status = 'done'; t.completedAt = now(); stamp(t, 'Reports printed, pick ticket completed'); save(); }
+    if (wait) { t.waiting = now(); stamp(t, 'Taker report printed, waiting for parts'); }
+    else if (first) { t.status = 'done'; t.completedAt = now(); stamp(t, hasProblems(t) ? 'Reports printed, pick ticket completed' : 'Taker report with the mismatched serial numbers printed, pick ticket completed'); }
+    if (mismatches(t).length) t.mismatchPrinted = true;
+    save();
     $('#printArea').innerHTML = printHtml(t);
     if (wait) go('ticket'); else render();
     if (embedded) toast(wait ? 'Saved as Waiting for parts. Print from the installed iPad app.' : first ? 'Pick ticket completed. Print from the installed iPad app.' : 'Printing works in the installed iPad app.');
@@ -872,17 +1196,6 @@ const actions = {
     stamp(t, 'Taker report printed again'); save();
     $('#printArea').innerHTML = printHtml(t);
     if (embedded) toast('Printing works in the installed iPad app.'); else setTimeout(() => window.print(), 100);
-  },
-  makeLabels: async b => {
-    const t = current(), c = t.labels.find(x => x.id === b.dataset.id);
-    const missing = ['model', 'serial', 'power', 'gph', 'psi', 'lph', 'bar', 'removed'].filter(k => !String(c[k] || '').trim());
-    if (missing.length) return toast('Fill in: ' + missing.map(k => k === 'removed' ? 'removed liquid end' : k.toUpperCase()).join(', ') + '.');
-    try {
-      const blob = new Blob([await labelSheet(c)], { type: 'application/pdf' });
-      c.madeAt = now(); stamp(t, `Label sheet made: ${c.model} serial ${c.serial}`); save(); render();
-      if (embedded) return toast('Label sheet made. Opening it works in the installed iPad app.');
-      await deliverFile(blob, `${t.orderNumber} - ${c.model} - ${c.serial} - labels.pdf`.replace(/[\\/:*?"<>|]/g, '_'), 'Label sheet ready', 'Print the label sheet at actual size on label paper.');
-    } catch (e) { console.error(e); toast('The label sheet could not be made.'); }
   },
   shareFile: async () => {
     const s = view.sheet; view.sheet = null; renderSheet();
@@ -1015,16 +1328,21 @@ document.addEventListener('input', e => {
   const el = e.target;
   if (el.dataset.draft) view.draft[el.dataset.draft] = el.value;
   else if (el.dataset.line) view.draft.lines[+el.dataset.line][el.dataset.key] = el.value;
-  else if (el.dataset.retbin) {
-    const [pi, ri] = el.dataset.retbin.split(':').map(Number), r = current().products[pi].returns[ri];
-    r.bin = el.value.trim().toUpperCase(); r.binBlank = true; save();
-  }
-  else if (el.dataset.label) {
-    const t = current(), c = t.labels.find(x => x.id === el.dataset.label);
-    c[el.dataset.key] = el.value.trim();
-    if (el.dataset.key === 'gph') { c.lph = P.toLph(c.gph); const o = $(`#lab-${c.id}-lph`); if (o) o.value = c.lph; }
-    if (el.dataset.key === 'psi') { c.bar = P.toBar(c.psi); const o = $(`#lab-${c.id}-bar`); if (o) o.value = c.bar; }
+  else if (el.dataset.serialbox) {
+    // Typing the ticket's own number checks it like a tap. The screen isn't redrawn while typing, so the next tap
+    // lands on the button under the finger; the note and the serial button change in place.
+    const [si, k] = el.dataset.serialbox.split(':').map(Number), x = current().conv.stacks[si].items[k], typed = el.value.trim().toUpperCase();
+    if (x.serial && sameSerial(typed, x.serial)) { x.box = ''; x.ok = true; } else { x.box = typed; x.ok = !!typed; }
     save();
+    const note = $(`#soff-${si}-${k}`), btn = $(`.serialBtn[data-s="${si}"][data-k="${k}"]`), on = x.ok && !x.box;
+    if (note) note.hidden = !(x.box && x.serial);
+    if (btn) { btn.classList.toggle('on', on); btn.setAttribute('aria-pressed', on); btn.textContent = (on ? '✓ ' : '') + shortSerial(x.serial); }
+  }
+  else if (el.dataset.labf && view.sheet) {
+    const c = view.sheet.c, k = el.dataset.labf;
+    c[k] = el.value;
+    if (k === 'gph') { c.lph = P.toLph(c.gph.trim()); $('#labf-lph').value = c.lph; }
+    if (k === 'psi') { c.bar = P.toBar(c.psi.trim()); $('#labf-bar').value = c.bar; }
   }
   else if (el.id === 'pNote' && view.sheet) view.sheet.note = el.value;
   else if (el.dataset.need && view.sheet) {
@@ -1041,6 +1359,7 @@ document.addEventListener('dragover', e => e.preventDefault());
 document.addEventListener('drop', e => { e.preventDefault(); importPdfs([...e.dataTransfer.files]); });
 
 pdfjsLib.GlobalWorkerOptions.workerSrc = 'pdf.worker.min.js';
+document.body.insertAdjacentHTML('beforeend', ART_DEFS);
 load(); render(); pickup(true);
 document.addEventListener('visibilitychange', () => { if (document.visibilityState === 'visible') pickup(); });
 if ('serviceWorker' in navigator && !embedded && location.protocol === 'https:') navigator.serviceWorker.register('sw.js').catch(() => {});

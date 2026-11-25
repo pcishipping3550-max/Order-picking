@@ -177,7 +177,43 @@ input.binBlank:disabled { opacity: 1; }
 
 /* labels */
 .labelCard { border-top: 1px solid var(--line); padding-top: 1rem; margin-top: 1rem; }
+.labelCard:first-child { border-top: 0; padding-top: 0; margin-top: 0; }
+.labelCard h3 { margin-bottom: .3rem; font-family: var(--font-num); }
+.labelCard p { margin-bottom: .5rem; }
+.labelCard .row { margin: 0; }
 .labelCard input { font-family: var(--font-num); }
+
+/* stacks: the items of one finished pump, each serial number tapped once it matches the box */
+.stepCard.hasArt { display: grid; grid-template-columns: minmax(200px, 300px) minmax(0, 1fr); gap: 1.25rem; align-items: center; }
+.stepArt { background: #fff; border: 1px solid var(--line); border-radius: 12px; padding: .4rem; }
+.stepArt svg { display: block; width: 100%; height: auto; }
+.stackLine { margin: .75rem 0 0; font: 600 1rem/1.35 var(--font-num); color: var(--muted); }
+.stackItems { list-style: none; margin: 0 0 1rem; padding: 0; display: grid; gap: .6rem; }
+.stackItems li { display: flex; flex-wrap: wrap; align-items: center; gap: .6rem 1rem; background: var(--surface); border: 1px solid var(--line); border-radius: 14px; padding: .75rem .9rem; }
+.stackItems .what { flex: 1 1 220px; }
+.serialBtn { min-width: 150px; min-height: 56px; font: 700 1.35rem/1 var(--font-num); }
+.serialBtn.on { background: var(--ok-bg); border: 2px solid var(--ok); color: var(--ok); }
+.serialBox { flex: 1 1 100%; max-width: 360px; }
+.serialBox input { font: 700 1.15rem var(--font-num); text-transform: uppercase; }
+.stackItems .warnText { flex: 1 1 100%; margin: 0; }
+.tapeList { margin: .75rem 0 0; padding-left: 1.2rem; display: grid; gap: .35rem; font-size: 1.05rem; }
+.tapeList strong { font-family: var(--font-num); }
+
+/* step drawings: light parts on white, in dark mode too, like a printed sheet */
+.a-gray rect, .a-gray circle, .a-gray polygon, .a-gray ellipse { fill: #eceae4; stroke: #6b6a64; }
+.a-blue rect, .a-blue circle, .a-blue polygon { fill: #dbe8fb; stroke: #2f6bd0; }
+.a-red rect, .a-red circle { fill: #fbdcdc; stroke: #c33; }
+.a-amber rect, .a-amber polygon { fill: #fbefcf; stroke: #b8860b; }
+.a-coral rect, .a-coral polygon { fill: #fbe0d6; stroke: #c8553d; }
+.a-green rect { fill: #dff3e4; stroke: #2f8f4e; }
+.a-pink rect { fill: #fbe0ee; stroke: #c2477f; }
+.a-teal rect, .a-teal polygon, .a-teal ellipse { fill: #d6f2ef; stroke: #1f8a80; }
+.a-purple rect, .a-purple polygon { fill: #e9e0fb; stroke: #6b47c2; }
+.a-gray *, .a-blue *, .a-red *, .a-amber *, .a-coral *, .a-green *, .a-pink *, .a-teal *, .a-purple * { stroke-width: 1.2; vector-effect: non-scaling-stroke; }
+.a-arr { stroke: #555; fill: none; stroke-width: 1.5; vector-effect: non-scaling-stroke; }
+.a-ts, .a-th { font-family: var(--font-ui); fill: #222; stroke: none; }
+.a-ts { font-size: 12px; } .a-th { font-size: 14px; font-weight: 600; }
+.a-green .a-ts { fill: #2f8f4e; }
 
 /* bottom action bar */
 .actionsBar { position: sticky; bottom: 0; display: flex; flex-wrap: wrap; justify-content: flex-end; gap: .75rem; padding: .75rem 0 calc(.75rem + env(safe-area-inset-bottom, 0px)); background: linear-gradient(to bottom, transparent, var(--bg) 30%); }
@@ -214,6 +250,7 @@ input.binBlank:disabled { opacity: 1; }
 .rAddr { display: grid; grid-template-columns: 1fr 1fr; gap: 1rem; margin: .5rem 0 1rem; }
 .rLead { font-weight: 700; }
 .rStamp { margin: 0 0 .75rem; text-align: center; font: 900 clamp(2.4rem, 9vw, 5.5rem)/1.05 var(--font-ui); letter-spacing: .06em; color: #111; }
+.rStamp.rMismatch { margin: 1rem 0 .75rem; font-size: clamp(1.7rem, 6vw, 3.4rem); letter-spacing: .03em; }
 .printSteps { margin-bottom: 1rem; }
 .printSteps p { margin: 0 0 .5rem; }
 .printSteps p:last-child { margin: 0; }
@@ -245,6 +282,8 @@ input.binBlank:disabled { opacity: 1; }
   .actionsBar .primary, .actionsBar .answer { min-width: 0; flex: 1; }
   .rAddr { grid-template-columns: 1fr; }
   .stepText { font-size: 1.25rem; }
+  .stepCard.hasArt { grid-template-columns: minmax(0, 1fr); }
+  .stepArt { max-width: 380px; }
   .charts { grid-template-columns: minmax(0, 1fr); }
 }
 @media (prefers-reduced-motion: reduce) { .progress div { transition: none; } }
@@ -258,4 +297,5 @@ input.binBlank:disabled { opacity: 1; }
   #printArea .report:last-child { break-after: auto; }
   #printArea .report + .report { border: 0; margin: 0; padding: 0; }
   #printArea .rStamp { font-size: 64pt; }
+  #printArea .rStamp.rMismatch { font-size: 38pt; }
 }
