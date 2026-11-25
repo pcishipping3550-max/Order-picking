@@ -922,8 +922,16 @@ async function labelSheet(c) {
   const pdf = await PDFLib.PDFDocument.load(await labelTemplateBytes()), form = pdf.getForm(), val = k => String(c[k] == null ? '' : c[k]).trim();
   for (const n of ['1', '2', '3']) { form.getTextField('MODEL ' + n).setText(val('model')); form.getTextField('SERIAL ' + n).setText(val('serial')); }
   for (const k of ['POWER', 'LPH', 'BAR', 'GPH', 'PSI']) form.getTextField(k).setText(val(k.toLowerCase()));
-  form.getTextField('ITEM').setText(c.item != null ? val('item') : val('removed'));
+  const item = c.item != null ? val('item') : val('removed');
+  form.getTextField('ITEM').setText(item);
   for (const name of ['MODEL 2', 'SERIAL 2', 'MODEL 3', 'SERIAL 3']) barcodeBeside(pdf.getPage(0), form, name, 470);
+  // The order and pick ticket numbers, small, on each outside sticker that has something on it (john 2026-11-25):
+  // along the bottom of the ITEM sticker and beside SERIAL# on both big labels. The pump's own small label gets none.
+  if (val('order') || val('ticket')) {
+    const page = pdf.getPage(0), font = await pdf.embedFont(PDFLib.StandardFonts.Helvetica), at = y => trackCodes(page, font, val('order'), val('ticket'), 470, y);
+    if (item) at(418.7);
+    if (val('model') || val('serial')) { at(272.5); at(69); }
+  }
   form.flatten();
   return pdf.save();
 }
@@ -961,11 +969,43 @@ function barcodeBeside(page, form, name, right) {
   }
 }
 
+// Code 128, the kind on the warehouse's bin and box labels: short for numbers (two digits a bar pattern), so the order
+// and pick ticket barcodes stay small. Each pattern is the widths of bar, space, bar, space... in narrow bars.
+const CODE128 = ('212222 222122 222221 121223 121322 131222 122213 122312 132212 221213 221312 231212 112232 122132 122231 113222 ' +
+  '123122 123221 223211 221132 221231 213212 223112 312131 311222 321122 321221 312212 322112 322211 212123 212321 232121 111323 ' +
+  '131123 131321 112313 132113 132311 211313 231113 231311 112133 112331 132131 113123 113321 133121 313121 211331 231131 213113 ' +
+  '213311 213131 311123 311321 331121 312113 312311 332111 314111 221411 431111 111224 111422 121124 121421 141122 141221 112214 ' +
+  '112412 122114 122411 142112 142211 241211 221114 413111 241112 134111 111242 121142 121241 114212 124112 124211 411212 421112 ' +
+  '421211 212141 214121 412121 111143 111341 131141 114113 114311 411113 411311 113141 114131 311141 411131 211412 211214 211232 2331112').split(' ');
+
+// The bar pattern for a value: digit pairs (set C) when the value is an even number of digits, else a character each (set B).
+function code128(value) {
+  const s = String(value), pairs = /^(\d\d)+$/.test(s);
+  if (!s || [...s].some(ch => ch < ' ' || ch > '~')) return '';
+  const codes = pairs ? [105, ...s.match(/\d\d/g).map(Number)] : [104, ...[...s].map(ch => ch.charCodeAt(0) - 32)];
+  codes.push(codes.reduce((sum, v, i) => sum + v * (i || 1), 0) % 103, 106);
+  return codes.map(v => CODE128[v]).join('');
+}
+
+// The order and pick ticket barcodes side by side, ending at right, each with its number in small print under it;
+// y is where the small print sits. Bars are a hundredth of an inch, whole dots on a 300 or 600 dpi printer.
+function trackCodes(page, font, order, ticket, right, y) {
+  const m = 0.72, h = 16, size = 5.5;
+  for (const [label, value] of [['Pick ticket', ticket], ['Order', order]]) {
+    const bars = code128(value); if (!bars) continue;
+    const caption = label + ' ' + value, bw = [...bars].reduce((n, w) => n + +w, 0) * m, tw = font.widthOfTextAtSize(caption, size), w = Math.max(bw, tw);
+    let x = right - w / 2 - bw / 2;
+    [...bars].forEach((n, i) => { if (i % 2 === 0) page.drawRectangle({ x, y: y + size + 1.5, width: n * m, height: h, color: PDFLib.rgb(0, 0, 0) }); x += n * m; });
+    page.drawText(caption, { x: right - w / 2 - tw / 2, y, size, font, color: PDFLib.rgb(0, 0, 0) });
+    right -= w + 14; // the gap is wider than the 10 narrow bars of blank a scanner needs beside a barcode
+  }
+}
+
 async function printPages(t, pages, byHand = false) {
   if (!pages.length) return toast('There are no label pages to print.');
   try {
     const out = await PDFLib.PDFDocument.create();
-    for (const c of pages) { const doc = await PDFLib.PDFDocument.load(await labelSheet(c)); const [pg] = await out.copyPages(doc, [0]); out.addPage(pg); }
+    for (const c of pages) { const doc = await PDFLib.PDFDocument.load(await labelSheet({ ...c, order: t.orderNumber, ticket: t.ticket })); const [pg] = await out.copyPages(doc, [0]); out.addPage(pg); }
     const blob = new Blob([await out.save()], { type: 'application/pdf' });
     if (!byHand) { t.conv.printed = t.conv.printed || {}; for (const c of pages) t.conv.printed[c.key] = now(); }
     stamp(t, (byHand ? 'Label made by hand: ' : pages.length > 1 ? 'Label pages printed: ' : 'Label page printed: ') + pages.map(c => [c.model, c.serial, c.item].filter(Boolean).join(' ')).join(', ')); save(); render();
