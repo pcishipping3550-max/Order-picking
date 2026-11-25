@@ -324,7 +324,12 @@ function labelPages(t) {
     const stickers = s.returns.filter(r => kindOf(r.item) !== 'driver' && kindOf(r.item) !== 'pump');
     pages.push({ key: `${i}:pump`, stack: i, model: s.model, serial: serialOf(keep), power: powerOf(s.model), gph: d.gph, psi: d.psi, lph: d.lph, bar: d.bar, item: itemText(stickers[0]), to: on(keep) });
     stickers.slice(1).forEach((r, k) => pages.push({ key: `${i}:item${k + 1}`, stack: i, model: '', serial: '', power: '', gph: '', psi: '', lph: '', bar: '', item: itemText(r), to: on(keep) }));
-    s.returns.filter(r => kindOf(r.item) === 'driver').forEach((r, k) => pages.push({ key: `${i}:driver${k}`, stack: i, model: r.item, serial: serialOf(donor), power: powerOf(r.item), gph: '', psi: '', lph: '', bar: '', item: '', to: on(donor || keep) }));
+    // a returned driver's flow rate and pressure: its own line when it gives them, else the pump it came off
+    const rated = x => x ? P.labelDefaults({ item: x.item || '', desc: x.desc || '' }) : {};
+    s.returns.filter(r => kindOf(r.item) === 'driver').forEach((r, k) => {
+      const f = [r, donor].map(rated).find(x => x.gph || x.psi) || {};
+      pages.push({ key: `${i}:driver${k}`, stack: i, model: r.item, serial: serialOf(donor), power: powerOf(r.item), gph: f.gph || '', psi: f.psi || '', lph: f.lph || '', bar: f.bar || '', item: '', to: on(donor || keep) });
+    });
   });
   return pages.map(pg => ({ ...pg, ...(edits[pg.key] || {}) }));
 }
